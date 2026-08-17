@@ -1,6 +1,7 @@
 venv/
 __pycache__/
 *.pyc
+.claude/
 logs/*.log
 data/*.db
 data/faces/*
