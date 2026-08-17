@@ -115,3 +115,9 @@ def delete_scan(conn: sqlite3.Connection, scan_id: int) -> None:
     """Delete a single scan row by id. Does not touch image files on disk -- callers remove those separately."""
     conn.execute("DELETE FROM scans WHERE id = ?", (scan_id,))
     conn.commit()
+
+
+def update_match_result(conn: sqlite3.Connection, scan_id: int, match_result: str) -> None:
+    """Update a previously saved scan's match_result, e.g. when an operator applies a manual override from the history list."""
+    conn.execute("UPDATE scans SET match_result = ? WHERE id = ?", (match_result, scan_id))
+    conn.commit()
