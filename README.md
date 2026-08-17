@@ -8,6 +8,14 @@ each capture and reviews each result. No data leaves the local machine at runtim
 
 ## Setup
 
+Every time the app starts, `main.py` runs an automatic prerequisite check (`prerequisites.py`)
+before opening the main window: it looks for Tesseract, the downloaded InsightFace model, and
+two connected cameras, and for anything missing that it can fix itself (Tesseract, the model,
+or a Python package), it asks via a dialog whether to install/download it now. Cameras are
+reported but never prompted on, since missing hardware can't be installed. The manual steps
+below are what that checker automates, and remain here for anyone who prefers to set the
+machine up ahead of time or without clicking through dialogs at first launch.
+
 ### 1. Python environment
 
 Requires Python 3.11+ (developed and tested against 3.13).
@@ -121,6 +129,7 @@ written (`storage/db.py`).
 
 ```
 main.py                  Entry point: wires config, DB, retention job, launches the UI
+prerequisites.py          Startup checks for Tesseract/InsightFace model/cameras/packages, with install/download prompts
 ui/                       PyQt6 main window (single combined screen)
 capture/                  Camera enumeration and manual still-frame capture
 face/                     Face detection, embedding, and similarity matching

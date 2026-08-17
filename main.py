@@ -7,12 +7,7 @@ from types import TracebackType
 
 from PyQt6.QtWidgets import QApplication
 
-from capture.camera_manager import CameraManager
-from config.settings import ensure_default_settings, get_doc_camera_index, get_face_camera_index
-from face.detector import load_face_analysis_model
-from storage.db import get_connection, initialize_schema
-from storage.retention import purge_expired_scans
-from ui.main_window import MainWindow
+from prerequisites import run_prerequisite_check
 
 LOG_PATH = Path(__file__).resolve().parent / "logs" / "app.log"
 
@@ -36,9 +31,23 @@ def _configure_logging() -> None:
 
 
 def main() -> None:
-    """Bootstrap the app: initialize storage, purge expired scans, load the face model, and launch the UI."""
+    """Bootstrap the app: check prerequisites, initialize storage, purge expired scans, load the face model, and launch the UI."""
     _configure_logging()
     logging.info("Starting ID Verification app")
+
+    # QApplication must exist before any prerequisite dialog can be shown, so this is
+    # constructed first; every other import below is deferred until after the prerequisite
+    # check specifically so a missing package is caught by that check (with an offer to
+    # install it) rather than crashing the process with an ImportError beforehand.
+    app = QApplication(sys.argv)
+    run_prerequisite_check()
+
+    from capture.camera_manager import CameraManager
+    from config.settings import ensure_default_settings, get_doc_camera_index, get_face_camera_index
+    from face.detector import load_face_analysis_model
+    from storage.db import get_connection, initialize_schema
+    from storage.retention import purge_expired_scans
+    from ui.main_window import MainWindow
 
     conn = get_connection()
     initialize_schema(conn)
@@ -55,7 +64,6 @@ def main() -> None:
         doc_camera_index=get_doc_camera_index(conn),
     )
 
-    app = QApplication(sys.argv)
     window = MainWindow(conn, camera_manager, face_analysis_app)
     window.show()
     exit_code = app.exec()
