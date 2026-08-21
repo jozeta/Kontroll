@@ -257,9 +257,10 @@ independent of document authenticity — a document can be internally consistent
 while still failing one of these:
 
 - **Under 18**: flagged when the extracted birth date puts the person's current age below 18.
-- **Expired document**: flagged when the extracted expiry date is in the past (MRZ documents
-  only — driving licences have no machine-readable expiry field to check against, see
-  `document/dl_field_parser.py`).
+- **Expired document**: flagged when the extracted expiry date is in the past. Works for MRZ
+  documents (passports, national ID cards) and driving licences alike — for a driving licence,
+  the expiry date is read from field 4b of the EU-harmonized printed layout (see
+  `document/dl_field_parser.py`), a heuristic OCR read rather than a checksum-validated one.
 
 Either condition shows a red **⚠ UNDER 18 / EXPIRED** banner directly on that scan's row in the
 history list (not hidden behind "Details"), and is included in the exported HTML report.
@@ -326,7 +327,7 @@ capture/                  Camera enumeration and manual still-frame capture
 face/                     Face detection, embedding, and similarity matching
 document/
   ocr.py, mrz_parser.py, barcode_parser.py, doc_classifier.py, field_crosscheck.py
-  dl_field_parser.py       OCR-heuristic name/DOB extraction for MRZ-less driving licences
+  dl_field_parser.py       OCR-heuristic name/DOB/expiry-date extraction for MRZ-less driving licences
   country_flags.py         ISO 3166-1 alpha-3 -> alpha-2 lookup used by ui/flag_icons.py
   image_quality.py         Blur/glare check on the captured document frame
   dates.py                 Shared MRZ/ISO date parsing and age calculation (birth date, expiry date)

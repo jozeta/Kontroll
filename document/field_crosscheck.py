@@ -53,7 +53,7 @@ def check_person_flags(fields: dict[str, str]) -> PersonFlagsResult:
 
     fields is whichever structured field dict the document pipeline produced -- MRZ fields (6-digit
     'YYMMDD' dates) for passports/ID cards, or the OCR-heuristic driving-licence fields (ISO
-    'YYYY-MM-DD' birth_date, no expiry_date -- see dl_field_parser.py) for driving licences.
+    'YYYY-MM-DD' birth_date/expiry_date -- see dl_field_parser.py) for driving licences.
     A missing or unparseable field simply produces no flag for that check, the same "nothing to
     check" handling the rest of this module gives absent data, rather than a guessed pass/fail.
     """

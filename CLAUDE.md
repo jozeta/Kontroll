@@ -88,9 +88,8 @@ runs, in order:
    keyword fallback for barcode-only docs) → `field_crosscheck.py::determine_validation_status`
    (the decision point for `validation_status`) and `field_crosscheck.py::check_person_flags`
    (separate under-18/expired-document flags — see below). When no MRZ is found (e.g. a driving
-   licence), `dl_field_parser.py` heuristically extracts name/birth-date from the OCR text
-   instead, anchored on the EU-harmonized numbered field layout — no expiry date is available
-   that way, so the expired-document flag never fires for MRZ-less documents.
+   licence), `dl_field_parser.py` heuristically extracts name/birth-date/expiry-date from the OCR
+   text instead, anchored on the EU-harmonized numbered field layout (fields 1/2/3/4b).
 4. **Persist**: both images saved to the face/document image directories resolved by
    `config/app_paths.py` (LOCALAPPDATA-based by default, independently operator-configurable —
    *not* a fixed `data/` path relative to the project), one row written via
@@ -110,11 +109,13 @@ runs, in order:
 Independent of `validation_status` — a document can be structurally authentic
 (`validation_status='valid'`) and still trip one of these; neither flag ever changes
 `validation_status` itself. `is_minor` comes from the extracted `birth_date`; `is_expired` from
-the extracted `expiry_date` (MRZ documents only — driving licences have none, see above). Both
-dates are parsed via `document/dates.py::parse_mrz_style_date`, which is deliberately asymmetric
-about century inference for the MRZ 6-digit `YYMMDD` case: birth dates assume the past (a 2-digit
-year greater than the current one implies 19XX), expiry dates always resolve to 20XX (documents
-don't have multi-decade validity and the MRZ format itself postdates 1980). Stored under
+the extracted `expiry_date` -- both MRZ documents and driving licences (`dl_field_parser.py`,
+field 4b) can populate this now. Both dates are parsed via
+`document/dates.py::parse_mrz_style_date`, which is deliberately asymmetric about century
+inference for the MRZ 6-digit `YYMMDD` case: birth dates assume the past (a 2-digit year greater
+than the current one implies 19XX), expiry dates always resolve to 20XX (documents don't have
+multi-decade validity and the MRZ format itself postdates 1980) -- moot for driving licences,
+whose OCR-extracted dates are already unambiguous 4-digit-year ISO strings. Stored under
 `validation_detail_json`'s `person_flags` key and shown as a red banner directly on the scan row
 (not hidden behind "Details"), and included in the exported HTML report (`ui/scan_export.py`).
 
