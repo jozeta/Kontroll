@@ -102,8 +102,17 @@ at all.
 ```
 venv\Scripts\activate
 pip install pyinstaller
-pyinstaller --onedir --name Kontroll --noconfirm main.py
+pyinstaller --onedir --name Kontroll --noconfirm --additional-hooks-dir=pyinstaller_hooks main.py
 ```
+
+`--additional-hooks-dir=pyinstaller_hooks` is required, not optional: `pyinstaller_hooks/hook-insightface.py`
+bundles one data file (`meanshape_68.pkl`) that InsightFace's landmark model loads by hand at
+runtime rather than importing, so PyInstaller's normal import-graph analysis never discovers it
+on its own. Without this flag, the build still completes and the app still starts and loads the
+face model fine — the crash only happens on the *first actual face capture*, deep inside
+InsightFace with `AttributeError: 'NoneType' object has no attribute 'shape'`, which makes it an
+easy step to accidentally skip. See `pyinstaller_hooks/hook-insightface.py`'s own docstring for
+the full mechanism.
 
 This produces `dist\Kontroll\Kontroll.exe` plus a `dist\Kontroll\_internal\` folder holding the
 bundled interpreter, packages, and Qt plugins — copy the whole `dist\Kontroll\` folder together
@@ -127,7 +136,9 @@ the script/EXE location, which would otherwise land inside PyInstaller's temp ex
 
 After building, verify it actually runs before distributing it: launch `dist\Kontroll\Kontroll.exe`
 directly and confirm the main window opens and the log file (Settings → log file location) is
-being written to.
+being written to. **Also click "Capture & Process" at least once** — startup alone doesn't
+exercise the face detection code path, which is exactly where a missing PyInstaller data file
+(see the `--additional-hooks-dir` note above) shows up.
 
 ### Setting up Tesseract OCR and the InsightFace model with only the EXE
 

@@ -179,6 +179,21 @@ before a given key existed will lack it.
   and then sets `pytesseract.pytesseract.tesseract_cmd` explicitly to the known install path
   rather than relying on a PATH refresh, so OCR works immediately in the same running process.
 
+### PyInstaller build requires `pyinstaller_hooks/hook-insightface.py`
+
+`--additional-hooks-dir=pyinstaller_hooks` (see README "Building a standalone EXE") is not
+optional. InsightFace's `insightface/data/pickle_object.py::get_object()` loads
+`meanshape_68.pkl` (used only by the 3D-68 landmark model's pose estimation, part of buffalo_l)
+by hand via a file path, not an import — with an explicit `if sys.frozen: base_dir =
+sys._MEIPASS` branch that expects the file at `<bundle root>/objects/meanshape_68.pkl`, a
+different layout than the installed package's own `insightface/data/objects/meanshape_68.pkl`.
+PyInstaller's default import-graph analysis has no way to discover this, so a build without the
+hook completes fine and the app starts and loads the face model fine — the crash only surfaces
+on the *first actual face capture* (`AttributeError: 'NoneType' object has no attribute 'shape'`
+deep inside `insightface/utils/transform.py::estimate_affine_matrix_3d23d`), which is why
+"the app launched, looked fine" isn't sufficient EXE verification — see README's "click Capture &
+Process at least once" note.
+
 ### Portable deployment (`config/bundled_deps.py`)
 
 Tesseract and the InsightFace model can each optionally be bundled as a plain folder copy next to
