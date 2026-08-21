@@ -1,12 +1,16 @@
 """Cross-checks OCR-extracted fields against MRZ/barcode-extracted fields, flagging mismatches and 'unverifiable' documents."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import date
 
+from document.dates import calculate_age, parse_mrz_style_date
 from document.mrz_parser import MrzResult
 
 # Rough heuristic threshold for the barcode/OCR word-overlap check below: not calibrated against
 # real captured pairs, same caveat as config.settings.DEFAULT_FACE_MATCH_THRESHOLD.
 _BARCODE_OVERLAP_VALID_RATIO = 0.5
+
+MINOR_AGE_THRESHOLD_YEARS = 18
 
 
 @dataclass
@@ -25,6 +29,55 @@ class CrosscheckResult:
     validation_status: str  # 'valid' / 'review' / 'invalid' / 'unverifiable'
     field_comparisons: list[FieldComparison]
     notes: list[str]
+
+
+@dataclass
+class PersonFlagsResult:
+    """Age/expiry business-rule flags derived from a document's extracted fields, kept separate from validation_status.
+
+    These are orthogonal to document authenticity: a document can be structurally valid and
+    internally consistent (validation_status='valid') yet still belong to a minor or be expired.
+    Neither condition changes validation_status -- they're their own flags so the UI can surface
+    them distinctly rather than folding a business rule into the authenticity signal.
+    """
+
+    is_minor: bool
+    age_years: int | None
+    is_expired: bool
+    expiry_date_display: str | None
+    notes: list[str] = field(default_factory=list)
+
+
+def check_person_flags(fields: dict[str, str]) -> PersonFlagsResult:
+    """Check a document's extracted birth_date/expiry_date fields for under-18 age and expiry.
+
+    fields is whichever structured field dict the document pipeline produced -- MRZ fields (6-digit
+    'YYMMDD' dates) for passports/ID cards, or the OCR-heuristic driving-licence fields (ISO
+    'YYYY-MM-DD' birth_date, no expiry_date -- see dl_field_parser.py) for driving licences.
+    A missing or unparseable field simply produces no flag for that check, the same "nothing to
+    check" handling the rest of this module gives absent data, rather than a guessed pass/fail.
+    """
+    notes: list[str] = []
+
+    birth_date = parse_mrz_style_date(fields.get("birth_date", ""), assume_past=True)
+    age_years = calculate_age(birth_date) if birth_date is not None else None
+    is_minor = age_years is not None and age_years < MINOR_AGE_THRESHOLD_YEARS
+    if is_minor:
+        notes.append(f"Person is under {MINOR_AGE_THRESHOLD_YEARS} (age {age_years})")
+
+    expiry_date = parse_mrz_style_date(fields.get("expiry_date", ""), assume_past=False)
+    is_expired = expiry_date is not None and expiry_date < date.today()
+    expiry_date_display = expiry_date.isoformat() if expiry_date is not None else None
+    if is_expired:
+        notes.append(f"Document expired on {expiry_date_display}")
+
+    return PersonFlagsResult(
+        is_minor=is_minor,
+        age_years=age_years,
+        is_expired=is_expired,
+        expiry_date_display=expiry_date_display,
+        notes=notes,
+    )
 
 
 def _field_appears_in_ocr(value: str, ocr_text: str) -> bool:

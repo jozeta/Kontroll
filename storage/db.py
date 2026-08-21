@@ -1,14 +1,17 @@
 """SQLite connection handling and schema creation for the scans/settings tables."""
 
 import sqlite3
-from pathlib import Path
 
-# All runtime-generated state (database, captured images, logs) lives under data/,
-# which is excluded from git and, unlike the app database itself, receives no
-# application-level encryption -- disk-at-rest protection for this file is expected
-# to come from OS-level full-disk encryption (BitLocker) on the deployment machine.
-# See README.md "Security posture" for the full accepted-risk statement.
-DB_PATH: Path = Path(__file__).resolve().parent.parent / "data" / "app.db"
+from config.app_paths import get_db_dir
+
+# The database directory is resolved via config.app_paths rather than a path relative to this
+# file's own location -- once packaged as a standalone EXE, a __file__-relative path resolves
+# inside an ephemeral or not-reliably-writable location. See config/app_paths.py for the full
+# rationale and how the operator-configurable location works. This receives no application-level
+# encryption -- disk-at-rest protection for this file is expected to come from OS-level full-disk
+# encryption (BitLocker) on the deployment machine. See README.md "Security posture" for the full
+# accepted-risk statement.
+DB_PATH = get_db_dir() / "app.db"
 
 
 def get_connection() -> sqlite3.Connection:

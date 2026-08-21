@@ -1,10 +1,39 @@
+# Python
 venv/
 __pycache__/
 *.pyc
+
+# PyInstaller build output (see README.md "Building a standalone EXE"), plus the portable
+# release/ folder assembled from it (EXE + bundled tesseract/models -- see "Portable / USB-stick
+# deployment"): both are build artifacts, not source, and release/ in particular is ~1GB.
+build/
+dist/
+release/
+*.spec
+
+# Runtime-generated data now lives under %LOCALAPPDATA%\Kontroll\, not the project directory
+# (see config/app_paths.py) -- these are only ignored defensively in case older code or a stray
+# script ever recreates them here.
+data/
+logs/
+
+# Optional portable copies of Tesseract OCR and the InsightFace model, placed next to main.py (or
+# next to Kontroll.exe in a build) for USB-stick/relocatable deployment -- see config/bundled_deps.py
+# and README.md "Portable / USB-stick deployment". Large, machine-downloaded binaries, not source.
+/tesseract/
+/models/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Claude Code local session state/config -- .claude/ covers per-project settings, hooks, and
+# session state (nothing in here is currently populated, but the whole directory is excluded
+# defensively); .mcp.json and CLAUDE.local.md are Claude Code config files that can live at the
+# project root instead. CLAUDE.md itself is deliberately NOT excluded -- unlike these, it's
+# checked-in project documentation (see the "Add CLAUDE.md" commit), not local tool state.
 .claude/
-logs/*.log
-data/*.db
-data/faces/*
-data/documents/*
-!data/faces/.gitkeep
-!data/documents/.gitkeep
+.mcp.json
+CLAUDE.local.md

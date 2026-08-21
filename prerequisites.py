@@ -11,6 +11,8 @@ instead.
 """
 
 import importlib.util
+import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -18,6 +20,16 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from PyQt6.QtWidgets import QMessageBox, QWidget
+
+from config.bundled_deps import (
+    INSIGHTFACE_LEGACY_MODEL_FILE,
+    INSIGHTFACE_MODEL_FILE,
+    INSIGHTFACE_PORTABLE_ROOT,
+    TESSDATA_DIR,
+    TESSERACT_EXE,
+)
+
+logger = logging.getLogger(__name__)
 
 # Maps each requirements.txt entry to the module name Python actually imports it under, since
 # a few of them differ (e.g. the "opencv-python" package is imported as "cv2").
@@ -35,9 +47,10 @@ _REQUIRED_PACKAGES = {
 
 _TESSERACT_COMMON_INSTALL_PATH = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
 
-# The recognition model is the last file InsightFace's downloader writes for the buffalo_l pack,
-# so its presence is a reasonable proxy for "the whole pack finished downloading".
-_INSIGHTFACE_MODEL_FILE = Path.home() / ".insightface" / "models" / "buffalo_l" / "w600k_r50.onnx"
+# INSIGHTFACE_MODEL_FILE / INSIGHTFACE_LEGACY_MODEL_FILE (imported above) point at the same
+# proxy file -- the last one InsightFace's downloader writes for the buffalo_l pack, so its
+# presence is a reasonable proxy for "the whole pack finished downloading" -- at the portable
+# and legacy machine-wide locations respectively. See config/bundled_deps.py.
 
 
 @dataclass
@@ -50,32 +63,65 @@ class PrerequisiteStatus:
     can_auto_install: bool
 
 
+def _is_frozen() -> bool:
+    """True when running as a PyInstaller-frozen executable rather than from a source checkout."""
+    return getattr(sys, "frozen", False)
+
+
 def check_python_packages() -> PrerequisiteStatus:
-    """Confirm every required third-party package actually imports; catches an incomplete or corrupted venv."""
+    """Confirm every required third-party package actually imports; catches an incomplete or corrupted venv (or, when frozen, an incomplete packaged build)."""
     missing_packages = [
         requirement_name
         for requirement_name, module_name in _REQUIRED_PACKAGES.items()
         if importlib.util.find_spec(module_name) is None
     ]
-    if missing_packages:
+    if not missing_packages:
+        return PrerequisiteStatus("Python packages", True, "All required packages are installed", can_auto_install=True)
+
+    if _is_frozen():
+        # There's no venv/pip to install into inside a frozen EXE -- a missing package here means
+        # the build itself is incomplete, not something an end user can fix by installing anything.
         return PrerequisiteStatus(
-            "Python packages", False, f"Missing: {', '.join(missing_packages)}", can_auto_install=True
+            "Python packages", False, f"Missing from this build: {', '.join(missing_packages)}", can_auto_install=False
         )
-    return PrerequisiteStatus("Python packages", True, "All required packages are installed", can_auto_install=True)
+    return PrerequisiteStatus("Python packages", False, f"Missing: {', '.join(missing_packages)}", can_auto_install=True)
 
 
 def check_tesseract() -> PrerequisiteStatus:
-    """Confirm the Tesseract OCR binary is discoverable, either on PATH or at the common Windows install location."""
-    if shutil.which("tesseract") is not None or _TESSERACT_COMMON_INSTALL_PATH.exists():
+    """Confirm the Tesseract OCR binary is discoverable: a portable copy next to the app, on PATH, or at the common Windows install location.
+
+    If it's only found at the portable or common-install-path location (not on PATH), point
+    pytesseract at it directly here -- otherwise this check would report "satisfied" while
+    document/ocr.py's plain pytesseract.image_to_string() call still shells out to a bare
+    "tesseract" that isn't on PATH and fails with TesseractNotFoundError. The portable copy is
+    checked first (see config/bundled_deps.py) since a machine could have both a portable copy
+    and an unrelated system-wide install; preferring the portable one is what makes the app
+    folder actually self-contained when both exist.
+    """
+    if TESSERACT_EXE.exists():
+        import pytesseract
+
+        pytesseract.pytesseract.tesseract_cmd = str(TESSERACT_EXE)
+        os.environ["TESSDATA_PREFIX"] = str(TESSDATA_DIR)
+        return PrerequisiteStatus("Tesseract OCR", True, "Found (portable copy)", can_auto_install=True)
+    if shutil.which("tesseract") is not None:
+        return PrerequisiteStatus("Tesseract OCR", True, "Found", can_auto_install=True)
+    if _TESSERACT_COMMON_INSTALL_PATH.exists():
+        import pytesseract
+
+        pytesseract.pytesseract.tesseract_cmd = str(_TESSERACT_COMMON_INSTALL_PATH)
         return PrerequisiteStatus("Tesseract OCR", True, "Found", can_auto_install=True)
     return PrerequisiteStatus(
-        "Tesseract OCR", False, "Not found on PATH or at the default install location", can_auto_install=True
+        "Tesseract OCR", False, "Not found in the portable tesseract\\ folder, on PATH, or at the default install location",
+        can_auto_install=True,
     )
 
 
 def check_insightface_model() -> PrerequisiteStatus:
-    """Confirm the buffalo_l face-recognition model pack has already been downloaded and cached locally."""
-    if _INSIGHTFACE_MODEL_FILE.exists():
+    """Confirm the buffalo_l face-recognition model pack has already been downloaded and cached locally, portably or at the legacy location."""
+    if INSIGHTFACE_MODEL_FILE.exists():
+        return PrerequisiteStatus("InsightFace buffalo_l model", True, "Found (portable copy)", can_auto_install=True)
+    if INSIGHTFACE_LEGACY_MODEL_FILE.exists():
         return PrerequisiteStatus("InsightFace buffalo_l model", True, "Found (already downloaded)", can_auto_install=True)
     return PrerequisiteStatus(
         "InsightFace buffalo_l model", False, "Not downloaded yet (~330MB, requires internet)", can_auto_install=True
@@ -107,7 +153,15 @@ def check_cameras() -> PrerequisiteStatus:
 
 
 def install_python_packages() -> bool:
-    """Run pip install -r requirements.txt against the current interpreter's environment."""
+    """Run pip install -r requirements.txt against the current interpreter's environment.
+
+    Never actually reachable when frozen (check_python_packages() reports can_auto_install=False
+    in that case) -- guarded here too as a defensive fallback, since sys.executable inside a
+    frozen EXE is the EXE itself, not a real Python interpreter, and there's no bundled
+    requirements.txt to point pip at either.
+    """
+    if _is_frozen():
+        return False
     requirements_path = Path(__file__).resolve().parent / "requirements.txt"
     result = subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(requirements_path)])
     return result.returncode == 0
@@ -137,11 +191,19 @@ def install_tesseract() -> bool:
 
 
 def download_insightface_model() -> bool:
-    """Trigger the InsightFace buffalo_l model download by constructing a FaceAnalysis instance."""
+    """Trigger the InsightFace buffalo_l model download by constructing a FaceAnalysis instance.
+
+    Downloads straight into the app's own portable "models" folder (INSIGHTFACE_PORTABLE_ROOT --
+    see config/bundled_deps.py) rather than the legacy .insightface folder under the user's home
+    directory, so a fresh download on a machine with no existing model anywhere ends up
+    self-contained by default. An existing legacy-location model is left untouched and still
+    found by check_insightface_model() / face/detector.py -- this only affects where a *new*
+    download lands.
+    """
     from insightface.app import FaceAnalysis
 
-    FaceAnalysis(name="buffalo_l")
-    return _INSIGHTFACE_MODEL_FILE.exists()
+    FaceAnalysis(name="buffalo_l", root=str(INSIGHTFACE_PORTABLE_ROOT))
+    return INSIGHTFACE_MODEL_FILE.exists()
 
 
 def run_prerequisite_check(parent: QWidget | None = None) -> None:
@@ -158,6 +220,14 @@ def run_prerequisite_check(parent: QWidget | None = None) -> None:
         check_insightface_model(),
         check_cameras(),
     ]
+
+    for status in statuses:
+        logger.info(
+            "Prerequisite check: %s -> %s (%s)",
+            status.name,
+            "satisfied" if status.satisfied else "NOT satisfied",
+            status.detail,
+        )
 
     installers = {
         "Python packages": install_python_packages,
@@ -179,12 +249,16 @@ def run_prerequisite_check(parent: QWidget | None = None) -> None:
             f"{status.name} is missing.\n\n{status.detail}\n\nInstall/download it now?",
         )
         if answer != QMessageBox.StandardButton.Yes:
+            logger.info("Operator declined to install '%s'", status.name)
             continue
 
+        logger.info("Operator requested install of '%s'", status.name)
         success = installers[status.name]()
         if success:
+            logger.info("Prerequisite '%s' installed successfully", status.name)
             QMessageBox.information(parent, "Prerequisite check", f"{status.name} installed successfully.")
         else:
+            logger.warning("Prerequisite '%s' installation failed", status.name)
             QMessageBox.warning(
                 parent,
                 "Prerequisite check",

@@ -1,15 +1,27 @@
 """App entry point: wires config, DB, retention job, and launches the PyQt6 UI."""
 
 import logging
+import logging.handlers
 import sys
-from pathlib import Path
+import time
 from types import TracebackType
 
 from PyQt6.QtWidgets import QApplication
 
+from config.app_paths import ensure_configured_dirs_exist, get_logs_dir
 from prerequisites import run_prerequisite_check
 
-LOG_PATH = Path(__file__).resolve().parent / "logs" / "app.log"
+logger = logging.getLogger(__name__)
+
+# Resolved via config.app_paths (LOCALAPPDATA-based, operator-configurable from the settings
+# window) rather than a path relative to this file's own location -- once packaged as a
+# standalone EXE, a __file__-relative path resolves inside an ephemeral or not-reliably-writable
+# location. See config/app_paths.py for the full rationale.
+LOG_PATH = get_logs_dir() / "app.log"
+
+_LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
+_LOG_MAX_BYTES = 5 * 1024 * 1024  # rotate at 5MB
+_LOG_BACKUP_COUNT = 3  # plus up to 3 rotated files (~20MB ceiling total)
 
 
 def _log_uncaught_exception(
@@ -21,25 +33,43 @@ def _log_uncaught_exception(
 
 
 def _configure_logging() -> None:
-    """Set up basic file logging and route uncaught exceptions into it -- the v1 scope is basic error/crash logging only, not a full audit trail."""
-    logging.basicConfig(
-        filename=LOG_PATH,
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    """Attach a size-rotated file handler to the root logger and route uncaught exceptions into it.
+
+    Every module logs via its own `logging.getLogger(__name__)`, which by default propagates up to
+    the root logger -- attaching the handler there (rather than per-module) is what gets every
+    module's log lines into the same file with one consistent format. Rotation (rather than a
+    single ever-growing file, the previous approach) matters now that the app logs every
+    significant operator action, not just startup/shutdown/errors -- daily use would otherwise
+    accumulate an unbounded file.
+    """
+    handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=_LOG_MAX_BYTES, backupCount=_LOG_BACKUP_COUNT, encoding="utf-8"
     )
+    handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    root_logger.addHandler(handler)
+
     sys.excepthook = _log_uncaught_exception
 
 
 def main() -> None:
     """Bootstrap the app: check prerequisites, initialize storage, purge expired scans, load the face model, and launch the UI."""
     _configure_logging()
-    logging.info("Starting ID Verification app")
+    logger.info("Starting Kontroll (log file: %s)", LOG_PATH)
 
     # QApplication must exist before any prerequisite dialog can be shown, so this is
     # constructed first; every other import below is deferred until after the prerequisite
     # check specifically so a missing package is caught by that check (with an offer to
     # install it) rather than crashing the process with an ImportError beforehand.
     app = QApplication(sys.argv)
+
+    # Must run before storage.db/ui.main_window are imported: those modules resolve (and
+    # silently auto-create) the same configured directories as a matter of course, which would
+    # bypass this operator prompt entirely if they ran first.
+    ensure_configured_dirs_exist()
+
     run_prerequisite_check()
 
     from capture.camera_manager import CameraManager
@@ -54,10 +84,12 @@ def main() -> None:
     ensure_default_settings(conn)
 
     purged_count = purge_expired_scans(conn)
-    logging.info("Retention purge removed %d expired scan(s)", purged_count)
+    logger.info("Retention purge removed %d expired scan(s)", purged_count)
 
-    logging.info("Loading face analysis model (buffalo_l)...")
+    logger.info("Loading face analysis model (buffalo_l)...")
+    model_load_started_at = time.monotonic()
     face_analysis_app = load_face_analysis_model()
+    logger.info("Face analysis model loaded in %.1fs", time.monotonic() - model_load_started_at)
 
     camera_manager = CameraManager(
         face_camera_index=get_face_camera_index(conn),
@@ -66,10 +98,11 @@ def main() -> None:
 
     window = MainWindow(conn, camera_manager, face_analysis_app)
     window.show()
+    logger.info("Main window shown; entering event loop")
     exit_code = app.exec()
 
     conn.close()
-    logging.info("ID Verification app exiting with code %d", exit_code)
+    logger.info("Kontroll exiting with code %d", exit_code)
     sys.exit(exit_code)
 
 

@@ -18,6 +18,10 @@ pip install -r requirements.txt
 python main.py
 ```
 
+Building a standalone/portable EXE (PyInstaller `--onedir`, plus optionally bundling Tesseract
+and the InsightFace model as portable folder copies) is a separate, longer workflow — see
+README.md "Building a standalone EXE" and "Portable / USB-stick deployment", not repeated here.
+
 There is no automated test suite (no pytest, no `tests/` directory). Verification during
 development has been done with throwaway ad-hoc scripts run against the venv interpreter,
 exercising real library behavior rather than mocks wherever practical (e.g. generating a
@@ -73,15 +77,23 @@ runs, in order:
    `embedder.py` picks the highest-confidence face and returns its 512-d normalized embedding;
    `matcher.py` computes cosine similarity against the configurable threshold and returns both
    the raw score and a bool — never just one or the other, since the UI must always show both.
-3. **Document pipeline** (`document/`): `ocr.py` (Tesseract via pytesseract) → `mrz_parser.py`
-   (locates MRZ-shaped lines by character set + fixed line width, then checksum-validates via
-   the `mrz` library — TD1/30-char/3-line, TD2/36-char/2-line, TD3/44-char/2-line, widths are
-   unique so there's no format ambiguity) → `barcode_parser.py` (PDF417 only, via zxing-cpp,
-   raw text only — no structured field parsing, since the Swedish driving licence PDF417 layout
-   is unvalidated against a real sample) → `doc_classifier.py` (type/country from MRZ document
-   code, or OCR keyword fallback for barcode-only docs) → `field_crosscheck.py` (the decision
-   point for `validation_status`).
-4. **Persist**: both images saved to `data/faces/`/`data/documents/`, one row written via
+3. **Document pipeline** (`document/`): `image_quality.py` flags a blurry (Laplacian-variance
+   proxy) or glare-heavy capture first — passive only, shown as a banner on the scan's thumbnail,
+   never blocks or retries → `ocr.py` (Tesseract via pytesseract) → `mrz_parser.py` (locates
+   MRZ-shaped lines by character set + fixed line width, then checksum-validates via the `mrz`
+   library — TD1/30-char/3-line, TD2/36-char/2-line, TD3/44-char/2-line, widths are unique so
+   there's no format ambiguity) → `barcode_parser.py` (PDF417 only, via zxing-cpp, raw text only
+   — no structured field parsing, since the Swedish driving licence PDF417 layout is unvalidated
+   against a real sample) → `doc_classifier.py` (type/country from MRZ document code, or OCR
+   keyword fallback for barcode-only docs) → `field_crosscheck.py::determine_validation_status`
+   (the decision point for `validation_status`) and `field_crosscheck.py::check_person_flags`
+   (separate under-18/expired-document flags — see below). When no MRZ is found (e.g. a driving
+   licence), `dl_field_parser.py` heuristically extracts name/birth-date from the OCR text
+   instead, anchored on the EU-harmonized numbered field layout — no expiry date is available
+   that way, so the expired-document flag never fires for MRZ-less documents.
+4. **Persist**: both images saved to the face/document image directories resolved by
+   `config/app_paths.py` (LOCALAPPDATA-based by default, independently operator-configurable —
+   *not* a fixed `data/` path relative to the project), one row written via
    `storage/models.py::insert_scan`, then prepended to the on-screen history list.
 
 ### `validation_status` semantics (decided in `document/field_crosscheck.py`)
@@ -92,6 +104,19 @@ runs, in order:
 - `valid` — MRZ or barcode cross-check passed cleanly.
 - `unverifiable` — neither MRZ nor barcode present; only OCR text available, nothing to
   cross-check it against. This must never be silently upgraded to `valid`.
+
+### Person flags: under-18 / expired document (`document/field_crosscheck.py::check_person_flags`)
+
+Independent of `validation_status` — a document can be structurally authentic
+(`validation_status='valid'`) and still trip one of these; neither flag ever changes
+`validation_status` itself. `is_minor` comes from the extracted `birth_date`; `is_expired` from
+the extracted `expiry_date` (MRZ documents only — driving licences have none, see above). Both
+dates are parsed via `document/dates.py::parse_mrz_style_date`, which is deliberately asymmetric
+about century inference for the MRZ 6-digit `YYMMDD` case: birth dates assume the past (a 2-digit
+year greater than the current one implies 19XX), expiry dates always resolve to 20XX (documents
+don't have multi-decade validity and the MRZ format itself postdates 1980). Stored under
+`validation_detail_json`'s `person_flags` key and shown as a red banner directly on the scan row
+(not hidden behind "Details"), and included in the exported HTML report (`ui/scan_export.py`).
 
 ### `match_result` semantics (`face/matcher.py` + `ui/main_window.py`)
 
@@ -106,10 +131,11 @@ recoverable once an override has been applied (accepted limitation, not a bug).
 
 First name, last name, birth date, and age shown in the history list are **not** separate DB
 columns — they're derived on the fly in `ui/main_window.py::_derive_display_fields` by parsing
-the `name`/`surname`/`birth_date` keys out of the scan's stored `doc_fields_json` (which is just
-`json.dumps(mrz_result.fields)`, empty `"{}"` when no MRZ was found). MRZ birth dates are 2-digit
-years; `_infer_birth_year` assumes the birth date is in the past (YY greater than the current
-2-digit year implies 19XX, otherwise 20XX) to pick a century before computing age.
+the `name`/`surname`/`birth_date` keys out of the scan's stored `doc_fields_json` (MRZ fields, or
+`dl_field_parser.py`'s heuristic fields for an MRZ-less driving licence; empty `"{}"` when
+neither found anything). Date parsing and age calculation (`parse_mrz_style_date`,
+`calculate_age`) live in `document/dates.py`, shared with `field_crosscheck.py::check_person_flags`
+above rather than duplicated — update both call sites' expectations together if this changes.
 
 ### Database
 
@@ -121,6 +147,29 @@ indices 0/1 — the threshold is explicitly flagged in a code comment there as a
 starting point, not a calibrated production value). No app-level encryption of the DB or images
 — relies entirely on BitLocker; see README "Security posture" before changing this assumption.
 
+`scans.validation_detail_json` is an unstructured, additively-grown JSON blob, not a fixed
+schema — it currently holds `notes` and `field_comparisons` (from `determine_validation_status`),
+`classified_from` (from `doc_classifier.py`), `image_quality` (from `image_quality.py`), and
+`person_flags` (from `check_person_flags`). Any new capture-time signal that isn't its own
+top-level column belongs here as another key, read defensively with `.get()` — old rows written
+before a given key existed will lack it.
+
+### Other windows and operator-facing features
+
+- `ui/settings_window.py` — data storage locations (via `config/app_paths.py`), manual purge,
+  camera-to-side assignment, capture keyboard shortcut, the live prerequisites checklist, and
+  triggering a backup (`storage/backup.py`, a single zip of the DB + all images for an operator
+  to copy off-machine — supplements BitLocker, doesn't replace it).
+- `ui/calibration_window.py` — captures a series of known-good same-person face-match score
+  samples on the operator's own hardware/lighting and suggests a threshold from that
+  distribution; scores are kept in memory only for the session and never written to the `scans`
+  table, so calibration captures never pollute real scan history.
+- `ui/scan_export.py` — builds one self-contained HTML report per scan (images as base64 data
+  URIs) for an operator to print or save as PDF via the browser; no PDF-generation dependency.
+- `ui/flag_icons.py` + `document/country_flags.py` — drawn (non-emoji) flag icons for a curated
+  set of ~24 countries, keyed off the MRZ nationality/issuing-country alpha-3 code converted to
+  alpha-2; unrecognized/uncurated codes show a neutral grey tile rather than a guess.
+
 ### Windows-specific choices worth knowing before "fixing" them
 
 - Camera enumeration/opening always passes `cv2.CAP_DSHOW` explicitly (`capture/camera_manager.py`,
@@ -130,10 +179,27 @@ starting point, not a calibrated production value). No app-level encryption of t
   and then sets `pytesseract.pytesseract.tesseract_cmd` explicitly to the known install path
   rather than relying on a PATH refresh, so OCR works immediately in the same running process.
 
+### Portable deployment (`config/bundled_deps.py`)
+
+Tesseract and the InsightFace model can each optionally be bundled as a plain folder copy next to
+the app itself (`tesseract\` and `models\buffalo_l\`, next to `main.py` in a source checkout or
+next to `Kontroll.exe` in a PyInstaller build) instead of relying on a machine-wide install —
+see README "Portable / USB-stick deployment" for the operator-facing how-to. `check_tesseract`/
+`check_insightface_model` (`prerequisites.py`) and `load_face_analysis_model` (`face/detector.py`)
+all check this portable location *first*, falling back to the previous machine-wide defaults
+(PATH / `C:\Program Files\Tesseract-OCR\` / `%USERPROFILE%\.insightface\`) so a non-portable
+install keeps working unchanged. This is deliberately the opposite direction of
+`config/app_paths.py`: that module keeps *writable* data under LOCALAPPDATA specifically because
+the install folder isn't guaranteed writable, whereas these two are read-only assets an operator
+explicitly opts into placing alongside the app, so resolving them relative to `sys.executable`
+(frozen) / the project root (source) is exactly what makes the whole folder portable.
+
 ## Known limitations (see README.md for full detail)
 
 - Face-match threshold (0.38) and the barcode/OCR word-overlap heuristic threshold (0.5, in
-  `document/field_crosscheck.py`) are both unvalidated starting points, not calibrated values.
+  `document/field_crosscheck.py`) are both unvalidated starting points, not calibrated values —
+  `ui/calibration_window.py` helps an operator pick a better face-match threshold from real
+  same-desk samples, but ships no equivalent tool for the barcode/OCR threshold.
 - PDF417 field-level parsing for Swedish driving licences is not implemented (no real sample was
   available to validate against) — `barcode_parser.py` returns raw decoded text only.
-- No image quality (glare/blur) check on captured document frames.
+- Curated flag icons (`ui/flag_icons.py`) cover ~24 countries; others show a neutral grey tile.

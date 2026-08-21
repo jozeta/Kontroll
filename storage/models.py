@@ -3,6 +3,7 @@
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 
 
 @dataclass
@@ -121,3 +122,25 @@ def update_match_result(conn: sqlite3.Connection, scan_id: int, match_result: st
     """Update a previously saved scan's match_result, e.g. when an operator applies a manual override from the history list."""
     conn.execute("UPDATE scans SET match_result = ? WHERE id = ?", (match_result, scan_id))
     conn.commit()
+
+
+def count_scans(conn: sqlite3.Connection) -> int:
+    """Return the total number of saved scan records, for display in the status bar."""
+    return conn.execute("SELECT COUNT(*) AS count FROM scans").fetchone()["count"]
+
+
+def calculate_scan_storage_bytes(*directories: Path) -> int:
+    """Sum the on-disk size of every file under the given directories (the saved face/document image folders).
+
+    Walks the filesystem directly rather than summing individual scans' recorded image paths, so
+    the figure reflects actual disk usage even if it includes an orphaned file left behind by a
+    prior crash mid-capture or mid-delete.
+    """
+    total_bytes = 0
+    for directory in directories:
+        if not directory.exists():
+            continue
+        for path in directory.rglob("*"):
+            if path.is_file():
+                total_bytes += path.stat().st_size
+    return total_bytes

@@ -4,6 +4,8 @@ import numpy as np
 from insightface.app import FaceAnalysis
 from insightface.app.common import Face
 
+from config.bundled_deps import resolve_insightface_root
+
 
 def load_face_analysis_model() -> FaceAnalysis:
     """Load the buffalo_l detection+recognition model pack. Expensive -- call once at app startup.
@@ -13,8 +15,11 @@ def load_face_analysis_model() -> FaceAnalysis:
     embedding as two independent models, so this single load is shared by both detector.py and
     embedder.py rather than repeated. ctx_id=-1 forces CPU execution, matching this project's
     plain (non-GPU) onnxruntime dependency.
+
+    root picks between the app's own portable "models" folder and the legacy .insightface folder
+    under the user's home directory -- see config/bundled_deps.py.
     """
-    app = FaceAnalysis(name="buffalo_l")
+    app = FaceAnalysis(name="buffalo_l", root=resolve_insightface_root())
     app.prepare(ctx_id=-1, det_size=(640, 640))
     return app
 

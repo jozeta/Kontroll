@@ -1,9 +1,12 @@
 """Enumerates UVC cameras and manages the two selected VideoCapture handles (face camera, document camera)."""
 
+import logging
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,6 +47,13 @@ class CameraManager:
         self.doc_camera_index: int = doc_camera_index
         self.face_capture: cv2.VideoCapture = cv2.VideoCapture(face_camera_index, cv2.CAP_DSHOW)
         self.doc_capture: cv2.VideoCapture = cv2.VideoCapture(doc_camera_index, cv2.CAP_DSHOW)
+        logger.info(
+            "Camera manager started: face camera index %d (opened=%s), document camera index %d (opened=%s)",
+            face_camera_index,
+            self.face_capture.isOpened(),
+            doc_camera_index,
+            self.doc_capture.isOpened(),
+        )
 
     def read_face_preview_frame(self) -> np.ndarray | None:
         """Read the latest available frame from the face camera, for live preview display only."""
@@ -60,14 +70,17 @@ class CameraManager:
         self.face_capture.release()
         self.face_camera_index = index
         self.face_capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        logger.info("Switched face camera to index %d (opened=%s)", index, self.face_capture.isOpened())
 
     def switch_doc_camera(self, index: int) -> None:
         """Release the current document camera handle and open a new one at the given device index."""
         self.doc_capture.release()
         self.doc_camera_index = index
         self.doc_capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
+        logger.info("Switched document camera to index %d (opened=%s)", index, self.doc_capture.isOpened())
 
     def release_all(self) -> None:
         """Release both camera handles, e.g. on app shutdown."""
+        logger.info("Releasing both camera handles")
         self.face_capture.release()
         self.doc_capture.release()
