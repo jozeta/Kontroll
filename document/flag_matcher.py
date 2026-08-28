@@ -1,0 +1,70 @@
+"""Cross-checks a scan's extracted document fields against the operator-maintained flagged-persons watch list.
+
+Matching is deliberately best-effort/heuristic, the same as the rest of the OCR-derived field
+extraction in this app (see dl_field_parser.py's docstring) -- a false negative (a flagged person
+not caught) degrades to the normal unflagged experience, while a false positive only costs the
+operator a moment's extra attention on a row that turns red, so leaning permissive is the safer
+failure direction for a desk-facing warning rather than an automated block.
+
+Personal-number matching currently only works for documents whose doc_fields includes a
+"personal_number" key -- today that's Swedish driving licences only (document/dl_field_parser.py's
+field 5). MRZ documents (passports, national ID cards) have no equivalent field extracted yet, so
+those fall back to name-only matching -- a known limitation, not a bug.
+"""
+
+import re
+from dataclasses import dataclass
+
+from storage.models import FlaggedPerson
+
+_NAME_TOKEN_PATTERN = re.compile(r"[A-ZÅÄÖÉ]+")
+
+
+@dataclass
+class FlagMatch:
+    """A flagged-persons watch-list entry that matched this scan, and which field the match was found on."""
+
+    flagged_person: FlaggedPerson
+    matched_on: str  # "name" / "personal_number"
+
+
+def normalize_personal_number(raw: str) -> str:
+    """Strip everything but digits and keep only the last 10 -- the YYMMDD-XXXX personnummer body -- so a 12-digit (century-prefixed) and a 10-digit rendering of the same number compare equal."""
+    digits = re.sub(r"\D", "", raw)
+    return digits[-10:] if len(digits) >= 10 else digits
+
+
+def normalize_name_tokens(raw: str) -> frozenset[str]:
+    """Break a name into a set of uppercase alphabetic tokens (2+ letters), order- and whitespace-insensitive, for comparing 'NYBERG LARS GÖRAN' against 'Lars Göran Nyberg' alike."""
+    return frozenset(token for token in _NAME_TOKEN_PATTERN.findall(raw.upper()) if len(token) > 1)
+
+
+def _scan_name_tokens(doc_fields: dict[str, str]) -> frozenset[str]:
+    full_name = f"{doc_fields.get('name', '')} {doc_fields.get('surname', '')}"
+    return normalize_name_tokens(full_name)
+
+
+def find_matching_flagged_person(doc_fields: dict[str, str], flagged_people: list[FlaggedPerson]) -> FlagMatch | None:
+    """Return the first flagged-persons entry whose name and/or personal number matches this scan's extracted fields, else None.
+
+    A personal-number match requires both sides to normalize to a full 10-digit body (guards
+    against a short/garbled OCR read coincidentally matching a short garbled watch-list entry). A
+    name match requires every token the operator entered to appear somewhere in the scan's
+    extracted name -- so a flagged entry of just a surname still catches a full extracted name,
+    without requiring an exact full-name match either direction.
+    """
+    scan_personal_number = normalize_personal_number(doc_fields.get("personal_number", ""))
+    scan_name_tokens = _scan_name_tokens(doc_fields)
+
+    for flagged_person in flagged_people:
+        if flagged_person.personal_number and scan_personal_number:
+            flagged_number = normalize_personal_number(flagged_person.personal_number)
+            if len(flagged_number) == 10 and flagged_number == scan_personal_number:
+                return FlagMatch(flagged_person=flagged_person, matched_on="personal_number")
+
+        if flagged_person.name and scan_name_tokens:
+            flagged_tokens = normalize_name_tokens(flagged_person.name)
+            if flagged_tokens and flagged_tokens.issubset(scan_name_tokens):
+                return FlagMatch(flagged_person=flagged_person, matched_on="name")
+
+    return None
