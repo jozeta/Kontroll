@@ -22,7 +22,7 @@ def get_connection() -> sqlite3.Connection:
 
 
 def initialize_schema(conn: sqlite3.Connection) -> None:
-    """Create the scans and settings tables if they do not already exist."""
+    """Create the scans, settings, and flagged_persons tables if they do not already exist, and apply any column migrations needed on top of an older existing scans table."""
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS scans (
@@ -50,4 +50,36 @@ def initialize_schema(conn: sqlite3.Connection) -> None:
         )
         """
     )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS flagged_persons (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            name TEXT,
+            personal_number TEXT,
+            image_path TEXT,
+            notes TEXT
+        )
+        """
+    )
+    _add_column_if_missing(conn, "scans", "operator_comment", "TEXT")
+    # list_scans/list_scans_older_than both order/filter on created_at -- without this, every
+    # history load and every retention purge does a full-table scan-and-sort instead of an
+    # indexed lookup, which only gets worse as scans accumulate (there's no retention limit by
+    # default, so this table is meant to grow indefinitely).
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_scans_created_at ON scans (created_at)")
     conn.commit()
+
+
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, column_type: str) -> None:
+    """Add a column to an already-existing table if it isn't there yet.
+
+    CREATE TABLE IF NOT EXISTS above is a no-op against a table an existing install already
+    created before this column existed, so a column added after v1's initial release needs this
+    explicit ALTER TABLE path instead -- sqlite has no "ADD COLUMN IF NOT EXISTS" on the version
+    this app's requirements.txt pins, so the existing-columns check is done by hand via
+    PRAGMA table_info.
+    """
+    existing_columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing_columns:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {column_type}")

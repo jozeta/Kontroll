@@ -6,10 +6,6 @@ from datetime import date
 from document.dates import calculate_age, parse_mrz_style_date
 from document.mrz_parser import MrzResult
 
-# Rough heuristic threshold for the barcode/OCR word-overlap check below: not calibrated against
-# real captured pairs, same caveat as config.settings.DEFAULT_FACE_MATCH_THRESHOLD.
-_BARCODE_OVERLAP_VALID_RATIO = 0.5
-
 MINOR_AGE_THRESHOLD_YEARS = 18
 
 
@@ -127,7 +123,27 @@ def crosscheck_mrz_against_ocr(mrz_result: MrzResult, ocr_text: str) -> Crossche
     return CrosscheckResult(validation_status="valid", field_comparisons=comparisons, notes=[])
 
 
-def crosscheck_barcode_against_ocr(barcode_texts: list[str], ocr_text: str) -> CrosscheckResult:
+def compute_barcode_ocr_overlap_ratio(barcode_texts: list[str], ocr_text: str) -> float | None:
+    """Compute the fraction of OCR words (longer than 2 characters) that also appear in the decoded barcode text, or None if no barcode was decoded at all.
+
+    Shared between crosscheck_barcode_against_ocr (which turns this ratio into a validation_status
+    against the operator's configured threshold) and ui/barcode_calibration_window.py (which shows
+    an operator the raw ratio distribution across real desk captures to help pick that threshold),
+    so the two can never compute it differently from each other.
+    """
+    if not barcode_texts:
+        return None
+
+    combined_barcode_text = " ".join(barcode_texts).upper()
+    ocr_words = [word for word in ocr_text.upper().split() if len(word) > 2]
+    if not ocr_words:
+        return 0.0
+
+    matching_word_count = sum(1 for word in ocr_words if word in combined_barcode_text)
+    return matching_word_count / len(ocr_words)
+
+
+def crosscheck_barcode_against_ocr(barcode_texts: list[str], ocr_text: str, overlap_threshold: float) -> CrosscheckResult:
     """Cross-check decoded PDF417 barcode text against the raw OCR text.
 
     Unlike MRZ fields, this app does not parse individual named fields out of the barcode payload
@@ -135,21 +151,16 @@ def crosscheck_barcode_against_ocr(barcode_texts: list[str], ocr_text: str) -> C
     this can only check whether the barcode decoded at all and whether its raw text substantially
     overlaps with the OCR text, rather than comparing named fields one by one. This is a
     deliberately weaker signal than the MRZ path and should not be presented to the operator as
-    equivalent confidence.
+    equivalent confidence. overlap_threshold is operator-configurable (config.settings'
+    barcode_overlap_threshold, calibratable via ui/barcode_calibration_window.py) rather than a
+    hardcoded constant, the same way face/matcher.py::match_faces takes its threshold as a
+    parameter instead of hardcoding it.
     """
-    if not barcode_texts:
+    overlap_ratio = compute_barcode_ocr_overlap_ratio(barcode_texts, ocr_text)
+    if overlap_ratio is None:
         return CrosscheckResult(validation_status="unverifiable", field_comparisons=[], notes=["No barcode decoded"])
 
-    combined_barcode_text = " ".join(barcode_texts).upper()
-    ocr_words = [word for word in ocr_text.upper().split() if len(word) > 2]
-
-    if not ocr_words:
-        overlap_ratio = 0.0
-    else:
-        matching_word_count = sum(1 for word in ocr_words if word in combined_barcode_text)
-        overlap_ratio = matching_word_count / len(ocr_words)
-
-    status = "valid" if overlap_ratio >= _BARCODE_OVERLAP_VALID_RATIO else "review"
+    status = "valid" if overlap_ratio >= overlap_threshold else "review"
     notes = [
         f"OCR/barcode word overlap ratio: {overlap_ratio:.2f} "
         "(field-level barcode parsing not implemented -- see README Known limitations)"
@@ -157,7 +168,9 @@ def crosscheck_barcode_against_ocr(barcode_texts: list[str], ocr_text: str) -> C
     return CrosscheckResult(validation_status=status, field_comparisons=[], notes=notes)
 
 
-def determine_validation_status(mrz_result: MrzResult, barcode_texts: list[str], ocr_text: str) -> CrosscheckResult:
+def determine_validation_status(
+    mrz_result: MrzResult, barcode_texts: list[str], ocr_text: str, barcode_overlap_threshold: float
+) -> CrosscheckResult:
     """Decide the overall validation_status for a scanned document: cross-check via MRZ if present, else via barcode, else mark it unverifiable.
 
     A document with neither an MRZ nor a barcode has only OCR text to go on, with no independent
@@ -168,7 +181,7 @@ def determine_validation_status(mrz_result: MrzResult, barcode_texts: list[str],
     if mrz_result.found:
         return crosscheck_mrz_against_ocr(mrz_result, ocr_text)
     if barcode_texts:
-        return crosscheck_barcode_against_ocr(barcode_texts, ocr_text)
+        return crosscheck_barcode_against_ocr(barcode_texts, ocr_text, barcode_overlap_threshold)
     return CrosscheckResult(
         validation_status="unverifiable",
         field_comparisons=[],

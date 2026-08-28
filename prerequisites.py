@@ -16,6 +16,8 @@ import os
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +30,7 @@ from config.bundled_deps import (
     TESSDATA_DIR,
     TESSERACT_EXE,
 )
+from config.ocr_languages import ADDITIONAL_OCR_LANGUAGES
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +49,11 @@ _REQUIRED_PACKAGES = {
 }
 
 _TESSERACT_COMMON_INSTALL_PATH = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
+
+# "tessdata_fast" (not the full "tessdata" repo) specifically -- its integer-quantized models are
+# a few MB each rather than tens of MB, which matters here since these download synchronously on
+# the operator's "Install now" click with no progress indicator.
+_TESSDATA_FAST_URL_TEMPLATE = "https://github.com/tesseract-ocr/tessdata_fast/raw/main/{lang_code}.traineddata"
 
 # INSIGHTFACE_MODEL_FILE / INSIGHTFACE_LEGACY_MODEL_FILE (imported above) point at the same
 # proxy file -- the last one InsightFace's downloader writes for the buffalo_l pack, so its
@@ -113,6 +121,75 @@ def check_tesseract() -> PrerequisiteStatus:
         return PrerequisiteStatus("Tesseract OCR", True, "Found", can_auto_install=True)
     return PrerequisiteStatus(
         "Tesseract OCR", False, "Not found in the portable tesseract\\ folder, on PATH, or at the default install location",
+        can_auto_install=True,
+    )
+
+
+def _resolve_active_tessdata_dir() -> Path | None:
+    """Return the tessdata\\ folder belonging to whichever Tesseract install check_tesseract() would resolve (portable copy, PATH, or the common install path), or None if Tesseract itself isn't found anywhere.
+
+    Re-derives the same three locations check_tesseract() checks, in the same priority order,
+    rather than reading back pytesseract's global tesseract_cmd state -- that state is only ever
+    set as a side effect of check_tesseract() having already run once this session, which this
+    function shouldn't have to assume.
+    """
+    if TESSERACT_EXE.exists():
+        return TESSDATA_DIR
+    which_path = shutil.which("tesseract")
+    if which_path is not None:
+        return Path(which_path).resolve().parent / "tessdata"
+    if _TESSERACT_COMMON_INSTALL_PATH.exists():
+        return _TESSERACT_COMMON_INSTALL_PATH.parent / "tessdata"
+    return None
+
+
+def check_ocr_language_packs() -> PrerequisiteStatus:
+    """Confirm every additional Tesseract language pack document/ocr.py requests (config.ocr_languages.ADDITIONAL_OCR_LANGUAGES) is installed alongside whichever Tesseract binary check_tesseract() found.
+
+    Checked independently of check_tesseract() itself since a machine can have Tesseract installed
+    with only its default English language data -- winget's silent install of the UB Mannheim
+    build doesn't pull in additional language packs -- which is a real, separately-fixable gap:
+    without them, document/ocr.py's multi-language OCR pass silently falls back to English-only
+    recognition for any language pack that's missing, which has no trained glyph shapes for that
+    language's own diacritics (å/ä/ö, ü/ß, é/ç, ñ, ...) and misreads them as plain unaccented
+    look-alikes instead of failing loudly.
+    """
+    tessdata_dir = _resolve_active_tessdata_dir()
+    if tessdata_dir is None:
+        return PrerequisiteStatus(
+            "OCR language packs", False, "Tesseract itself isn't installed yet -- install that first",
+            can_auto_install=False,
+        )
+
+    # Language display name and code always printed together ("German (deu)"), and the missing
+    # count/list kept separate from the full roster below -- a prior version of this message
+    # printed display names alone, which real operator confusion showed isn't unambiguous enough
+    # on its own (mistaking "Dutch" for "German"/"Deutsch", a classic false-friend pair, when only
+    # one of the two was actually reported missing). Spelling out the exact expected filename next
+    # to each name removes any doubt about which language a given .traineddata file is for.
+    missing = [
+        (lang_code, display_name)
+        for lang_code, display_name in ADDITIONAL_OCR_LANGUAGES.items()
+        if not (tessdata_dir / f"{lang_code}.traineddata").exists()
+    ]
+    roster_lines = "\n".join(
+        f"  [{'x' if (tessdata_dir / f'{code}.traineddata').exists() else ' '}] {name} ({code}.traineddata)"
+        for code, name in ADDITIONAL_OCR_LANGUAGES.items()
+    )
+
+    if not missing:
+        return PrerequisiteStatus(
+            "OCR language packs", True,
+            f"All {len(ADDITIONAL_OCR_LANGUAGES)} additional language packs found in {tessdata_dir}:\n{roster_lines}",
+            can_auto_install=True,
+        )
+    missing_summary = ", ".join(f"{name} ({code}.traineddata)" for code, name in missing)
+    return PrerequisiteStatus(
+        "OCR language packs", False,
+        f"{len(missing)} of {len(ADDITIONAL_OCR_LANGUAGES)} additional language packs missing from "
+        f"{tessdata_dir}:\n{roster_lines}\n\n"
+        f"Missing: {missing_summary} -- these languages' accented characters will misread as "
+        "their plain unaccented equivalents without them",
         can_auto_install=True,
     )
 
@@ -190,6 +267,40 @@ def install_tesseract() -> bool:
     return True
 
 
+def install_ocr_language_packs() -> bool:
+    """Download every additional Tesseract language pack found missing by check_ocr_language_packs() straight into the active tessdata\\ folder.
+
+    Each is a single small file fetched directly from the tesseract-ocr project's own
+    tessdata_fast GitHub repo via urllib (no new dependency needed just for this) -- not run
+    through winget/an installer, since UB Mannheim's package doesn't expose "add a language pack
+    to an existing install" as a separate winget-able unit. Downloads whichever packs are still
+    missing one at a time and reports overall success only if every one of them ends up present --
+    a partial failure partway through (e.g. a dropped connection) still leaves whatever already
+    downloaded successfully in place rather than being rolled back, since each is independently
+    useful once installed.
+    """
+    tessdata_dir = _resolve_active_tessdata_dir()
+    if tessdata_dir is None:
+        return False
+
+    all_succeeded = True
+    for lang_code in ADDITIONAL_OCR_LANGUAGES:
+        destination = tessdata_dir / f"{lang_code}.traineddata"
+        if destination.exists():
+            continue
+        try:
+            with urllib.request.urlopen(_TESSDATA_FAST_URL_TEMPLATE.format(lang_code=lang_code), timeout=30) as response:
+                destination.write_bytes(response.read())
+        except (OSError, urllib.error.URLError):
+            logger.exception("Failed to download the '%s' Tesseract language pack to %s", lang_code, destination)
+            all_succeeded = False
+            continue
+        if not (destination.exists() and destination.stat().st_size > 0):
+            all_succeeded = False
+
+    return all_succeeded
+
+
 def download_insightface_model() -> bool:
     """Trigger the InsightFace buffalo_l model download by constructing a FaceAnalysis instance.
 
@@ -217,6 +328,7 @@ def run_prerequisite_check(parent: QWidget | None = None) -> None:
     statuses = [
         check_python_packages(),
         check_tesseract(),
+        check_ocr_language_packs(),
         check_insightface_model(),
         check_cameras(),
     ]
@@ -232,6 +344,7 @@ def run_prerequisite_check(parent: QWidget | None = None) -> None:
     installers = {
         "Python packages": install_python_packages,
         "Tesseract OCR": install_tesseract,
+        "OCR language packs": install_ocr_language_packs,
         "InsightFace buffalo_l model": download_insightface_model,
     }
 

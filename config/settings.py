@@ -2,13 +2,18 @@
 
 import sqlite3
 
-DEFAULT_RETENTION_DAYS: int = 90
+from capture.camera_manager import AUTO_LOWEST, ResolutionPreference
+
+RETENTION_DAYS_NEVER: int = 0
+
+# Defaults to "Never" (see RETENTION_DAYS_NEVER below) -- an operator has to opt into automatic
+# deletion of scan history rather than losing it silently by default.
+DEFAULT_RETENTION_DAYS: int = RETENTION_DAYS_NEVER
 
 # Stored in the same retention_days setting as an ordinary value (rather than a separate
 # enabled/disabled flag) so there's only ever one source of truth for the startup purge job to
 # read -- 0 days of retention is otherwise meaningless (nothing would ever be old enough to
 # survive a purge), so it's free to reuse as the "auto-purge disabled" sentinel.
-RETENTION_DAYS_NEVER: int = 0
 
 # Starting point for buffalo_l (ArcFace-family) cosine similarity on L2-normalized embeddings.
 # Published guidance for this model typically lands in the 0.30-0.45 range for same-domain
@@ -19,8 +24,31 @@ RETENTION_DAYS_NEVER: int = 0
 # override alongside the automated pass/fail badge, rather than only a hard gate.
 DEFAULT_FACE_MATCH_THRESHOLD: float = 0.38
 
+# Rough heuristic threshold for document/field_crosscheck.py's barcode/OCR word-overlap check
+# (used only when a document has a PDF417 barcode but no MRZ, e.g. most EU driving licences) --
+# not calibrated against real captured pairs, same caveat as DEFAULT_FACE_MATCH_THRESHOLD above.
+# ui/barcode_calibration_window.py helps an operator pick a better value from real desk captures,
+# mirroring ui/calibration_window.py's face-match calibration.
+DEFAULT_BARCODE_OVERLAP_THRESHOLD: float = 0.5
+
 DEFAULT_FACE_CAMERA_INDEX: int = 0
 DEFAULT_DOC_CAMERA_INDEX: int = 1
+
+# "auto_lowest" means "probe the camera and use the lowest resolution it actually honors" (see
+# capture.camera_manager.set_lowest_available_resolution); "auto" means the highest resolution the
+# camera honors (capture.camera_manager.set_best_available_resolution). An operator can switch
+# either camera to the other mode, or a fixed WIDTHxHEIGHT, from the Settings window.
+#
+# The two cameras get different factory defaults, not the same DEFAULT_CAMERA_RESOLUTION applied
+# to both as before: only the document camera's frame ever goes through OCR/MRZ/barcode reading,
+# and document/card_detector.py's own diagnosis of real production captures found the card itself
+# often occupies only ~25-30% of that frame -- at a low resolution, that leaves far too few pixels
+# on the card's actual printed text for Tesseract to read reliably (this was diagnosed as a
+# concrete cause of production OCR failures, not a theoretical concern). The face camera has no
+# equivalent floor -- face embedding downsamples to a small fixed input size regardless -- so it
+# keeps the low-bandwidth/low-CPU default.
+DEFAULT_FACE_CAMERA_RESOLUTION: str = AUTO_LOWEST
+DEFAULT_DOC_CAMERA_RESOLUTION: str = "auto"
 
 DEFAULT_CAPTURE_SHORTCUT: str = "F12"
 
@@ -29,13 +57,21 @@ DEFAULT_CAPTURE_SHORTCUT: str = "F12"
 # value -- same unvalidated-default caveat as DEFAULT_FACE_MATCH_THRESHOLD above.
 DEFAULT_DISK_SPACE_WARNING_MB: int = 2000
 
+# "system" defers to whatever palette PyQt6/the OS hands the app by default; "light"/"dark" force
+# an explicit QPalette override -- see ui/theme.py.
+DEFAULT_THEME: str = "system"
+
 DEFAULT_SETTINGS: dict[str, str] = {
     "retention_days": str(DEFAULT_RETENTION_DAYS),
     "face_match_threshold": str(DEFAULT_FACE_MATCH_THRESHOLD),
+    "barcode_overlap_threshold": str(DEFAULT_BARCODE_OVERLAP_THRESHOLD),
     "face_camera_index": str(DEFAULT_FACE_CAMERA_INDEX),
     "doc_camera_index": str(DEFAULT_DOC_CAMERA_INDEX),
+    "face_camera_resolution": DEFAULT_FACE_CAMERA_RESOLUTION,
+    "doc_camera_resolution": DEFAULT_DOC_CAMERA_RESOLUTION,
     "capture_shortcut": DEFAULT_CAPTURE_SHORTCUT,
     "disk_space_warning_mb": str(DEFAULT_DISK_SPACE_WARNING_MB),
+    "theme": DEFAULT_THEME,
 }
 
 
@@ -88,6 +124,11 @@ def get_face_match_threshold(conn: sqlite3.Connection) -> float:
     return float(get_setting(conn, "face_match_threshold"))
 
 
+def get_barcode_overlap_threshold(conn: sqlite3.Connection) -> float:
+    """Typed convenience accessor for the barcode_overlap_threshold setting."""
+    return float(get_setting(conn, "barcode_overlap_threshold"))
+
+
 def get_face_camera_index(conn: sqlite3.Connection) -> int:
     """Typed convenience accessor for the face_camera_index setting."""
     return int(get_setting(conn, "face_camera_index"))
@@ -98,6 +139,37 @@ def get_doc_camera_index(conn: sqlite3.Connection) -> int:
     return int(get_setting(conn, "doc_camera_index"))
 
 
+def _parse_camera_resolution(raw: str) -> ResolutionPreference:
+    """Parse a stored camera-resolution setting: "auto_lowest" means AUTO_LOWEST, "auto" (or anything else unrecognized) means None (auto-best), else "WIDTHxHEIGHT"."""
+    if raw == AUTO_LOWEST:
+        return AUTO_LOWEST
+    if "x" not in raw:
+        return None
+    width_str, _, height_str = raw.partition("x")
+    if not width_str.isdigit() or not height_str.isdigit():
+        return None
+    return (int(width_str), int(height_str))
+
+
+def get_face_camera_resolution(conn: sqlite3.Connection) -> ResolutionPreference:
+    """Typed convenience accessor for the face_camera_resolution setting. None means auto (best available); AUTO_LOWEST means auto (lowest available)."""
+    return _parse_camera_resolution(get_setting(conn, "face_camera_resolution"))
+
+
+def get_doc_camera_resolution(conn: sqlite3.Connection) -> ResolutionPreference:
+    """Typed convenience accessor for the doc_camera_resolution setting. None means auto (best available); AUTO_LOWEST means auto (lowest available)."""
+    return _parse_camera_resolution(get_setting(conn, "doc_camera_resolution"))
+
+
+def resolution_to_setting_value(resolution: ResolutionPreference) -> str:
+    """Inverse of _parse_camera_resolution: format a resolution preference back to its stored string form."""
+    if resolution is None:
+        return "auto"
+    if resolution == AUTO_LOWEST:
+        return AUTO_LOWEST
+    return f"{resolution[0]}x{resolution[1]}"
+
+
 def get_capture_shortcut(conn: sqlite3.Connection) -> str:
     """Typed convenience accessor for the capture_shortcut setting (a Qt key-sequence string, e.g. 'F12')."""
     return get_setting(conn, "capture_shortcut")
@@ -106,3 +178,8 @@ def get_capture_shortcut(conn: sqlite3.Connection) -> str:
 def get_disk_space_warning_mb(conn: sqlite3.Connection) -> int:
     """Typed convenience accessor for the disk_space_warning_mb setting."""
     return int(get_setting(conn, "disk_space_warning_mb"))
+
+
+def get_theme(conn: sqlite3.Connection) -> str:
+    """Typed convenience accessor for the theme setting ("system" / "light" / "dark")."""
+    return get_setting(conn, "theme")

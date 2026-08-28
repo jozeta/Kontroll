@@ -2,6 +2,7 @@
 shortcut, and a live prerequisites checklist with per-item install instructions."""
 
 import logging
+import shutil
 import sqlite3
 from datetime import datetime
 from pathlib import Path
@@ -9,68 +10,112 @@ from typing import Callable
 
 from insightface.app import FaceAnalysis
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QKeySequence
+from PyQt6.QtGui import QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
+    QFrame,
     QGroupBox,
     QHBoxLayout,
     QKeySequenceEdit,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QStyle,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from capture.camera_manager import CameraInfo, CameraManager, enumerate_cameras
+from capture.camera_manager import (
+    AUTO_LOWEST,
+    CameraInfo,
+    CameraManager,
+    enumerate_cameras,
+    probe_supported_resolutions,
+    set_best_available_resolution,
+    set_exact_resolution,
+    set_lowest_available_resolution,
+)
 from config.app_paths import (
     DB_DIR_KEY,
     DOCUMENTS_DIR_KEY,
     FACES_DIR_KEY,
     LOGS_DIR_KEY,
     get_configured_dir,
+    get_flagged_images_dir,
     get_pending_dir_change,
     path_label,
     request_dir_change,
 )
+from config.ocr_languages import ADDITIONAL_OCR_LANGUAGES
 from config.settings import (
     RETENTION_DAYS_NEVER,
+    get_barcode_overlap_threshold,
     get_capture_shortcut,
     get_disk_space_warning_mb,
+    get_doc_camera_resolution,
+    get_face_camera_resolution,
     get_face_match_threshold,
     get_retention_days,
+    get_theme,
+    resolution_to_setting_value,
     set_setting,
 )
 from prerequisites import (
     PrerequisiteStatus,
     check_cameras,
     check_insightface_model,
+    check_ocr_language_packs,
     check_python_packages,
     check_tesseract,
     download_insightface_model,
+    install_ocr_language_packs,
     install_python_packages,
     install_tesseract,
 )
 from storage.backup import create_backup_archive
+from storage.models import (
+    FlaggedPerson,
+    clear_flagged_match_for_person,
+    delete_flagged_person,
+    insert_flagged_person,
+    list_flagged_persons,
+)
 from storage.retention import purge_scans_older_than_days
+from ui.barcode_calibration_window import BarcodeCalibrationWindow
 from ui.calibration_window import CalibrationWindow
+from ui.flag_retroactive import run_retroactive_flag_check
+from ui.image_viewer import ClickableThumbnailLabel
+from ui.theme import THEME_CHOICES, THEME_DARK, THEME_LIGHT, THEME_SYSTEM, apply_theme
 
 logger = logging.getLogger(__name__)
 
 _PURGE_DAY_OPTIONS = [30, 90, 180, 365]
+
+_THEME_LABELS: dict[str, str] = {THEME_SYSTEM: "System default", THEME_LIGHT: "Light", THEME_DARK: "Dark"}
 
 # Cameras is deliberately absent: check_cameras() always has can_auto_install=False, since there's
 # nothing this app can install to fix missing hardware.
 _PREREQUISITE_INSTALLERS: dict[str, Callable[[], bool]] = {
     "Python packages": install_python_packages,
     "Tesseract OCR": install_tesseract,
+    "OCR language packs": install_ocr_language_packs,
     "InsightFace buffalo_l model": download_insightface_model,
 }
+
+# Built from config.ocr_languages.ADDITIONAL_OCR_LANGUAGES rather than hand-typed, so this list
+# can never drift out of sync with what document/ocr.py actually requests and
+# prerequisites.py::check_ocr_language_packs actually checks for.
+_OCR_LANGUAGE_ROSTER_TEXT = "\n".join(
+    f"  {display_name} -> {lang_code}.traineddata" for lang_code, display_name in ADDITIONAL_OCR_LANGUAGES.items()
+)
 
 _PREREQUISITE_INSTRUCTIONS: dict[str, str] = {
     "Python packages": (
@@ -81,6 +126,21 @@ _PREREQUISITE_INSTRUCTIONS: dict[str, str] = {
         "Download and run the installer from the UB Mannheim build:\n"
         "https://github.com/UB-Mannheim/tesseract/wiki\n\n"
         "Or click \"Install now\" below to install it automatically via winget."
+    ),
+    "OCR language packs": (
+        "Covers accented characters for every supported document-issuing country -- without a "
+        "language's pack, its accented letters (å/ä/ö, ü/ß, é/ç, ñ, ...) silently OCR as their "
+        "plain unaccented equivalents instead of erroring.\n\n"
+        "Full list of languages and the exact file each one needs (the checklist above shows "
+        "which of these are currently found/missing):\n"
+        f"{_OCR_LANGUAGE_ROSTER_TEXT}\n\n"
+        "Note: \"Dutch\" is the Netherlands' language (nld.traineddata) -- it is not the English "
+        "word for German (\"Deutsch\"), which is the separate \"German\" entry (deu.traineddata) "
+        "above. Check the language name against its file name here if a report seems off.\n\n"
+        "Download the missing .traineddata file(s) from "
+        "https://github.com/tesseract-ocr/tessdata_fast and place them in Tesseract's tessdata\\ "
+        "folder (the one named in the checklist above), or click \"Install now\" below to "
+        "download them automatically."
     ),
     "InsightFace buffalo_l model": (
         "This ~330MB face-recognition model pack downloads automatically the first time the app "
@@ -97,7 +157,13 @@ _PREREQUISITE_INSTRUCTIONS: dict[str, str] = {
 
 def _check_all_prerequisites() -> list[PrerequisiteStatus]:
     """Run every prerequisite check fresh (not cached), so the settings window always reflects current machine state."""
-    return [check_python_packages(), check_tesseract(), check_insightface_model(), check_cameras()]
+    return [
+        check_python_packages(),
+        check_tesseract(),
+        check_ocr_language_packs(),
+        check_insightface_model(),
+        check_cameras(),
+    ]
 
 
 class PrerequisiteInstallInfoWindow(QDialog):
@@ -156,6 +222,66 @@ class PrerequisiteInstallInfoWindow(QDialog):
             QMessageBox.warning(self, "Install", "Installation failed. See README.md for manual setup instructions.")
 
 
+_FLAGGED_THUMBNAIL_SIZE = (48, 48)
+
+
+class _FlaggedPersonRowWidget(QFrame):
+    """One row in the Flagged Users list: reference thumbnail (if any), name/personal number/notes, and a Remove button."""
+
+    def __init__(self, conn: sqlite3.Connection, flagged_person: FlaggedPerson, on_removed: Callable[[], None], parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.conn = conn
+        self.flagged_person = flagged_person
+        self._on_removed = on_removed
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+
+        row = QHBoxLayout(self)
+
+        thumbnail_label = ClickableThumbnailLabel(flagged_person.image_path, flagged_person.name or "Flagged person")
+        thumbnail_label.setFixedSize(*_FLAGGED_THUMBNAIL_SIZE)
+        pixmap = QPixmap(flagged_person.image_path) if flagged_person.image_path else None
+        if pixmap is not None and not pixmap.isNull():
+            thumbnail_label.setPixmap(
+                pixmap.scaled(*_FLAGGED_THUMBNAIL_SIZE, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            )
+            thumbnail_label.setCursor(Qt.CursorShape.PointingHandCursor)
+            thumbnail_label.setToolTip("Double-click to view full size")
+        else:
+            thumbnail_label.setText("No\nimage")
+            thumbnail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            thumbnail_label.setStyleSheet("color: gray; font-size: 8pt; border: 1px solid gray;")
+        row.addWidget(thumbnail_label)
+
+        info_column = QVBoxLayout()
+        info_column.addWidget(QLabel(f"<b>{flagged_person.name or '(no name)'}</b>"))
+        info_column.addWidget(QLabel(f"Personal number: {flagged_person.personal_number or '-'}"))
+        if flagged_person.notes:
+            info_column.addWidget(QLabel(f"Notes: {flagged_person.notes}"))
+        row.addLayout(info_column, stretch=1)
+
+        remove_button = QPushButton("Remove")
+        remove_button.setStyleSheet("color: #FF1744;")
+        remove_button.clicked.connect(self._on_remove_clicked)
+        row.addWidget(remove_button)
+
+    def _on_remove_clicked(self) -> None:
+        confirm = QMessageBox.question(
+            self,
+            "Remove flagged person",
+            f"Remove '{self.flagged_person.name or self.flagged_person.personal_number}' from the flagged-persons list?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        delete_flagged_person(self.conn, self.flagged_person.id)
+        cleared_count = clear_flagged_match_for_person(self.conn, self.flagged_person.id)
+        logger.info(
+            "Operator removed flagged person id=%d (cleared flag from %d scan(s))", self.flagged_person.id, cleared_count
+        )
+        self._on_removed()
+
+
 class SettingsWindow(QWidget):
     """A standalone settings window covering manual scan purge, camera assignment, the capture
     shortcut, and a live prerequisites checklist."""
@@ -167,6 +293,8 @@ class SettingsWindow(QWidget):
         face_analysis_app: FaceAnalysis,
         on_data_changed: Callable[[], None],
         on_capture_shortcut_changed: Callable[[str], None],
+        on_camera_probe_started: Callable[[], None] | None = None,
+        on_camera_probe_finished: Callable[[], None] | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent, Qt.WindowType.Window)
@@ -175,26 +303,135 @@ class SettingsWindow(QWidget):
         self.face_analysis_app = face_analysis_app
         self._on_data_changed = on_data_changed
         self._on_capture_shortcut_changed = on_capture_shortcut_changed
+        # Lets the main window pause its own live-preview poll (see ui/main_window.py) for the
+        # duration of a camera probe below -- both would otherwise read the same VideoCapture at
+        # once, since pumping the event loop mid-probe (via QApplication.processEvents, to avoid
+        # the app appearing frozen for the ~1-2s/camera this takes) lets that timer's callback run
+        # interleaved with the probe's own capture.set()/.read() calls.
+        self._on_camera_probe_started = on_camera_probe_started or (lambda: None)
+        self._on_camera_probe_finished = on_camera_probe_finished or (lambda: None)
         self._prerequisite_rows: dict[str, tuple[QLabel, QPushButton]] = {}
         self._path_rows: dict[str, tuple[QLabel, QLabel]] = {}
         self._calibration_window: CalibrationWindow | None = None
+        self._barcode_calibration_window: BarcodeCalibrationWindow | None = None
 
         self.setWindowTitle("Settings")
-        self.resize(480, 560)
+        self._apply_responsive_size()
         self._build_layout()
 
+    def _apply_responsive_size(self) -> None:
+        """Size the window generously but never larger than the available screen, and let it be resized down further -- tabs + per-tab scroll areas (see _build_scrollable_tab) mean no control ever gets stranded off-screen on a small/low-resolution display."""
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        width = min(560, available.width() - 60) if available is not None else 560
+        height = min(620, available.height() - 80) if available is not None else 620
+        self.resize(max(width, 360), max(height, 320))
+        self.setMinimumSize(360, 320)
+
     def _build_layout(self) -> None:
-        layout = QVBoxLayout(self)
+        """Group settings into tabs (each independently scrollable) rather than one long flat list -- keeps any single tab short enough to fit a small screen and avoids an overwhelming wall of controls."""
+        outer_layout = QVBoxLayout(self)
+        self.tab_widget = QTabWidget()
+        outer_layout.addWidget(self.tab_widget)
+
+        self.tab_widget.addTab(self._build_scrollable_tab(self._build_general_tab()), "General")
+        self._cameras_tab_index = self.tab_widget.addTab(self._build_scrollable_tab(self._build_cameras_tab()), "Cameras")
+        self.tab_widget.addTab(self._build_scrollable_tab(self._build_face_match_tab()), "Face Match")
+        self.tab_widget.addTab(self._build_scrollable_tab(self._build_document_validation_tab()), "Document Validation")
+        self.tab_widget.addTab(self._build_scrollable_tab(self._build_data_tab()), "Data")
+        self.tab_widget.addTab(self._build_scrollable_tab(self._build_flagged_users_tab()), "Flagged Users")
+        self.tab_widget.addTab(self._build_scrollable_tab(self._build_prerequisites_tab()), "Prerequisites")
+
+        # Detecting a camera's supported resolutions is a real hardware round-trip per candidate
+        # (~1-2s per camera) -- doing that for both cameras unconditionally while building this
+        # window (i.e. on every "Settings" click, since it's a singleton rebuilt only once per
+        # session) made opening it noticeably slow. Deferred to the first time the operator
+        # actually looks at the Cameras tab instead; _build_cameras_tab only does the cheap,
+        # instant part (current setting shown, nothing probed) up front.
+        self._resolutions_probed = False
+        self.tab_widget.currentChanged.connect(self._on_settings_tab_changed)
+
+    def _on_settings_tab_changed(self, index: int) -> None:
+        if index == self._cameras_tab_index and not self._resolutions_probed:
+            self._resolutions_probed = True
+            self._refresh_resolution_combo("face")
+            self._refresh_resolution_combo("doc")
+
+    def _build_scrollable_tab(self, content: QWidget) -> QScrollArea:
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        scroll_area.setWidget(content)
+        return scroll_area
+
+    def _build_general_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._build_appearance_group())
+        layout.addWidget(self._build_shortcut_group())
+        layout.addWidget(self._build_disk_space_warning_group())
+        layout.addStretch(1)
+        return page
+
+    def _build_cameras_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._build_camera_group())
+        layout.addStretch(1)
+        return page
+
+    def _build_face_match_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._build_face_match_threshold_group())
+        layout.addStretch(1)
+        return page
+
+    def _build_document_validation_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.addWidget(self._build_barcode_overlap_threshold_group())
+        layout.addStretch(1)
+        return page
+
+    def _build_data_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
         layout.addWidget(self._build_data_location_group())
         layout.addWidget(self._build_auto_purge_group())
         layout.addWidget(self._build_purge_group())
-        layout.addWidget(self._build_disk_space_warning_group())
         layout.addWidget(self._build_backup_group())
-        layout.addWidget(self._build_camera_group())
-        layout.addWidget(self._build_face_match_threshold_group())
-        layout.addWidget(self._build_shortcut_group())
+        layout.addStretch(1)
+        return page
+
+    def _build_prerequisites_tab(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
         layout.addWidget(self._build_prerequisites_group())
         layout.addStretch(1)
+        return page
+
+    # -- Appearance -------------------------------------------------------------------------------
+
+    def _build_appearance_group(self) -> QGroupBox:
+        group = QGroupBox("Appearance")
+        row = QHBoxLayout(group)
+        row.addWidget(QLabel("Theme:"))
+
+        self.theme_combo = QComboBox()
+        for mode in THEME_CHOICES:
+            self.theme_combo.addItem(_THEME_LABELS[mode], mode)
+        self.theme_combo.setCurrentIndex(self.theme_combo.findData(get_theme(self.conn)))
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        row.addWidget(self.theme_combo, stretch=1)
+
+        return group
+
+    def _on_theme_changed(self, _list_index: int) -> None:
+        mode = self.theme_combo.currentData()
+        set_setting(self.conn, "theme", mode)
+        apply_theme(QApplication.instance(), mode)
+        logger.info("Operator set the app theme to '%s'", mode)
 
     # -- Data storage locations -----------------------------------------------------------------
 
@@ -330,6 +567,13 @@ class SettingsWindow(QWidget):
         self.purge_days_combo = QComboBox()
         for days in _PURGE_DAY_OPTIONS:
             self.purge_days_combo.addItem(f"{days} days", days)
+        # A cutoff of 0 days ("older than now") already means "every scan" to
+        # purge_scans_older_than_days -- see its docstring -- so this reuses that behavior rather
+        # than needing a separate delete-everything code path. Kept out of _PURGE_DAY_OPTIONS
+        # (shared with the auto-purge-on-startup combo above) since "delete everything" would be a
+        # dangerous, easy-to-fat-finger choice for an *automatic* startup purge, unlike here where
+        # it's one deliberate manual action with its own stronger confirmation wording below.
+        self.purge_days_combo.addItem("All scans (delete everything)", 0)
         row.addWidget(self.purge_days_combo)
 
         purge_button = QPushButton("Purge")
@@ -341,10 +585,14 @@ class SettingsWindow(QWidget):
 
     def _on_purge_clicked(self) -> None:
         days = self.purge_days_combo.currentData()
+        if days == 0:
+            prompt = "Permanently delete ALL scans, including every saved image? This cannot be undone."
+        else:
+            prompt = f"Permanently delete every scan older than {days} days, including saved images? This cannot be undone."
         confirm = QMessageBox.question(
             self,
             "Purge old scans",
-            f"Permanently delete every scan older than {days} days, including saved images? This cannot be undone.",
+            prompt,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
@@ -352,7 +600,7 @@ class SettingsWindow(QWidget):
             return
 
         purged_count = purge_scans_older_than_days(self.conn, days)
-        logger.info("Operator purged %d scan(s) older than %d days", purged_count, days)
+        logger.info("Operator purged %d scan(s) (cutoff: %d days)", purged_count, days)
         QMessageBox.information(self, "Purge old scans", f"Deleted {purged_count} scan(s).")
         self._on_data_changed()
 
@@ -414,6 +662,12 @@ class SettingsWindow(QWidget):
         if not file_path:
             return
 
+        # Zipping every face/document image can take a real, noticeable stretch on a large image
+        # folder -- a busy cursor is the same minimal feedback used elsewhere in this window for a
+        # synchronous operation with no natural progress-reporting point (see
+        # _refresh_resolution_combo), so this doesn't look like the window has simply stopped
+        # responding for however long the archive takes to write.
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             create_backup_archive(
                 self.conn, get_configured_dir(FACES_DIR_KEY), get_configured_dir(DOCUMENTS_DIR_KEY), Path(file_path)
@@ -424,16 +678,168 @@ class SettingsWindow(QWidget):
                 self, "Backup failed", f"Could not write the backup archive to:\n{file_path}\n\nSee the log for details."
             )
             return
+        finally:
+            QApplication.restoreOverrideCursor()
 
         logger.info("Operator created a backup archive at %s", file_path)
         QMessageBox.information(self, "Backup complete", f"Backup saved to:\n{file_path}")
+
+    # -- Flagged Users ----------------------------------------------------------------------------
+
+    def _build_flagged_users_tab(self) -> QWidget:
+        """Build the Flagged Users tab: a manual add-entry form plus the current watch list.
+
+        Entries can also be added directly from a scan's detail section (see
+        ui/main_window.py::HistoryRowWidget._on_flag_person_clicked), prefilled from that scan's
+        extracted fields -- this form is for adding someone the operator already knows about
+        without needing a scan of them on hand first.
+        """
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        info_label = QLabel(
+            "When a new scan's extracted name or personal number matches an entry below, that "
+            "scan's row is highlighted red in the history list to warn the operator, and a large "
+            "warning appears immediately after capture. Adding an entry here also checks previously "
+            "saved scans for a match and offers to flag any it finds."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: gray;")
+        layout.addWidget(info_label)
+
+        layout.addWidget(self._build_add_flagged_person_group())
+
+        self.flagged_persons_list_layout = QVBoxLayout()
+        layout.addLayout(self.flagged_persons_list_layout)
+        self._refresh_flagged_persons_list()
+
+        layout.addStretch(1)
+        return page
+
+    def _build_add_flagged_person_group(self) -> QGroupBox:
+        group = QGroupBox("Add flagged person")
+        form_layout = QVBoxLayout(group)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self.new_flagged_name_edit = QLineEdit()
+        name_row.addWidget(self.new_flagged_name_edit, stretch=1)
+        form_layout.addLayout(name_row)
+
+        number_row = QHBoxLayout()
+        number_row.addWidget(QLabel("Personal number:"))
+        self.new_flagged_number_edit = QLineEdit()
+        self.new_flagged_number_edit.setPlaceholderText("YYMMDD-XXXX")
+        number_row.addWidget(self.new_flagged_number_edit, stretch=1)
+        form_layout.addLayout(number_row)
+
+        notes_row = QHBoxLayout()
+        notes_row.addWidget(QLabel("Notes:"))
+        self.new_flagged_notes_edit = QLineEdit()
+        self.new_flagged_notes_edit.setPlaceholderText("Optional")
+        notes_row.addWidget(self.new_flagged_notes_edit, stretch=1)
+        form_layout.addLayout(notes_row)
+
+        image_row = QHBoxLayout()
+        self._new_flagged_image_path: str | None = None
+        self.new_flagged_image_label = QLabel("No image selected")
+        self.new_flagged_image_label.setStyleSheet("color: gray;")
+        choose_image_button = QPushButton("Choose image...")
+        choose_image_button.clicked.connect(self._on_choose_flagged_image_clicked)
+        image_row.addWidget(choose_image_button)
+        image_row.addWidget(self.new_flagged_image_label, stretch=1)
+        form_layout.addLayout(image_row)
+
+        add_row = QHBoxLayout()
+        add_row.addStretch(1)
+        add_button = QPushButton("Add")
+        add_button.clicked.connect(self._on_add_flagged_person_clicked)
+        add_row.addWidget(add_button)
+        form_layout.addLayout(add_row)
+
+        return group
+
+    def _on_choose_flagged_image_clicked(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(self, "Choose reference image", "", "Images (*.jpg *.jpeg *.png)")
+        if not file_path:
+            return
+        self._new_flagged_image_path = file_path
+        self.new_flagged_image_label.setText(Path(file_path).name)
+
+    def _on_add_flagged_person_clicked(self) -> None:
+        name = self.new_flagged_name_edit.text().strip()
+        personal_number = self.new_flagged_number_edit.text().strip()
+        notes = self.new_flagged_notes_edit.text().strip()
+
+        if not name and not personal_number:
+            QMessageBox.warning(self, "Add flagged person", "Enter at least a name or a personal number.")
+            return
+
+        image_path: str | None = None
+        if self._new_flagged_image_path is not None:
+            source = Path(self._new_flagged_image_path)
+            destination = get_flagged_images_dir() / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{source.name}"
+            shutil.copyfile(source, destination)
+            image_path = str(destination)
+
+        flagged_person_id = insert_flagged_person(self.conn, name or None, personal_number or None, image_path, notes or None)
+        logger.info("Operator manually added flagged person id=%d", flagged_person_id)
+
+        self.new_flagged_name_edit.clear()
+        self.new_flagged_number_edit.clear()
+        self.new_flagged_notes_edit.clear()
+        self._new_flagged_image_path = None
+        self.new_flagged_image_label.setText("No image selected")
+        self._refresh_flagged_persons_list()
+
+        flagged_person = FlaggedPerson(
+            id=flagged_person_id,
+            created_at=datetime.now().isoformat(),
+            name=name or None,
+            personal_number=personal_number or None,
+            image_path=image_path,
+            notes=notes or None,
+        )
+        run_retroactive_flag_check(self.conn, flagged_person, self)
+        self._on_data_changed()
+
+    def refresh_flagged_persons_list(self) -> None:
+        """Public entry point for MainWindow to refresh this tab after a flagged-persons change made elsewhere in the app (e.g. a scan's own "Remove Flag" detail button)."""
+        self._refresh_flagged_persons_list()
+
+    def _refresh_flagged_persons_list(self) -> None:
+        """Rebuild the flagged-persons list from the database -- called on tab build and after any add/remove."""
+        while self.flagged_persons_list_layout.count():
+            item = self.flagged_persons_list_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        flagged_people = list_flagged_persons(self.conn)
+        if not flagged_people:
+            empty_label = QLabel("No flagged persons yet.")
+            empty_label.setStyleSheet("color: gray;")
+            self.flagged_persons_list_layout.addWidget(empty_label)
+            return
+
+        for flagged_person in flagged_people:
+            self.flagged_persons_list_layout.addWidget(
+                _FlaggedPersonRowWidget(self.conn, flagged_person, on_removed=self._on_flagged_person_removed)
+            )
+
+    def _on_flagged_person_removed(self) -> None:
+        """After a flagged-persons entry is removed from this tab's own list, rebuild the list itself and tell MainWindow so the history list's badges/red-row tinting clear too."""
+        self._refresh_flagged_persons_list()
+        self._on_data_changed()
 
     # -- Camera assignment ----------------------------------------------------------------------
 
     def _build_camera_group(self) -> QGroupBox:
         group = QGroupBox("Camera assignment")
         layout = QVBoxLayout(group)
-        cameras = enumerate_cameras()
+        # Opens up to 10 device indices in turn (see enumerate_cameras' docstring) -- pumping the
+        # event loop between each keeps this window's first build from reading as a freeze.
+        cameras = enumerate_cameras(on_index_tried=lambda _index: QApplication.processEvents())
 
         face_row = QHBoxLayout()
         face_row.addWidget(QLabel("Visitor camera (left):"))
@@ -441,6 +847,7 @@ class SettingsWindow(QWidget):
         self.face_camera_combo.currentIndexChanged.connect(self._on_face_camera_changed)
         face_row.addWidget(self.face_camera_combo, stretch=1)
         layout.addLayout(face_row)
+        layout.addWidget(self._build_resolution_row("face"))
 
         doc_row = QHBoxLayout()
         doc_row.addWidget(QLabel("Identification camera (right):"))
@@ -448,8 +855,136 @@ class SettingsWindow(QWidget):
         self.doc_camera_combo.currentIndexChanged.connect(self._on_doc_camera_changed)
         doc_row.addWidget(self.doc_camera_combo, stretch=1)
         layout.addLayout(doc_row)
+        layout.addWidget(self._build_resolution_row("doc"))
+
+        info_label = QLabel(
+            "\"Auto (lowest available)\" probes the camera and always uses the lowest resolution "
+            "it actually supports, for the lowest CPU/bandwidth cost -- the factory default for "
+            "the Visitor camera, which doesn't need much detail for face matching. \"Auto (best "
+            "available)\" does the same for the highest resolution -- the factory default for the "
+            "Identification camera, since OCR/MRZ reading needs real pixel detail on the card's "
+            "printed text; switch either camera to the other mode (or a specific resolution) if "
+            "needed, e.g. if the live preview warns that a low resolution may affect ID document "
+            "reading. Detecting the list below takes a couple of seconds per camera."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: gray;")
+        layout.addWidget(info_label)
 
         return group
+
+    def _build_resolution_row(self, side: str) -> QWidget:
+        """Build one camera's resolution picker: a combo of resolutions actually supported by that device, plus a Refresh button to re-probe on demand (e.g. after swapping hardware without restarting).
+
+        Populated cheaply (no hardware probe) at build time -- see _on_settings_tab_changed for
+        where the real probe (a real hardware round-trip per candidate resolution) is deferred to.
+        """
+        row_widget = QWidget()
+        row = QHBoxLayout(row_widget)
+        row.setContentsMargins(0, 0, 0, 10)
+        row.addWidget(QLabel("Resolution:"))
+
+        combo = QComboBox()
+        row.addWidget(combo, stretch=1)
+
+        refresh_button = QPushButton("Refresh")
+        refresh_button.setToolTip("Re-detect this camera's supported resolutions")
+        refresh_button.clicked.connect(lambda _checked, s=side: self._refresh_resolution_combo(s))
+        row.addWidget(refresh_button)
+
+        if side == "face":
+            self.face_resolution_combo = combo
+        else:
+            self.doc_resolution_combo = combo
+
+        self._populate_resolution_combo_minimal(side)
+        combo.currentIndexChanged.connect(lambda _list_index, s=side: self._on_resolution_changed(s))
+
+        return row_widget
+
+    def _populate_resolution_combo_minimal(self, side: str) -> None:
+        """Populate a resolution combo with both "Auto" choices plus whatever's currently configured, without touching the camera hardware at all -- the instant-and-cheap path used when the row is first built."""
+        combo = self.face_resolution_combo if side == "face" else self.doc_resolution_combo
+        current_resolution = get_face_camera_resolution(self.conn) if side == "face" else get_doc_camera_resolution(self.conn)
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Auto (best available)", None)
+        combo.addItem("Auto (lowest available)", AUTO_LOWEST)
+        if isinstance(current_resolution, tuple):
+            combo.addItem(f"{current_resolution[0]} × {current_resolution[1]}", current_resolution)
+        combo.setCurrentIndex(combo.findData(current_resolution))
+        combo.blockSignals(False)
+
+    def _refresh_resolution_combo(self, side: str) -> None:
+        """Probe the given camera's actually-supported resolutions (a real hardware round-trip, ~1-2s) and repopulate its combo, preserving the currently configured selection.
+
+        Pumps the event loop between each of the ~10 candidates tried (rather than blocking the
+        whole ~1-2s straight through) so the app stays responsive and doesn't read as frozen --
+        the live-preview poll is paused for the same span, since it would otherwise read from this
+        same capture concurrently with the probe's own capture.set()/.read() calls whenever a
+        pumped event lets its timer fire.
+        """
+        combo = self.face_resolution_combo if side == "face" else self.doc_resolution_combo
+        capture = self.camera_manager.face_capture if side == "face" else self.camera_manager.doc_capture
+        current_resolution = get_face_camera_resolution(self.conn) if side == "face" else get_doc_camera_resolution(self.conn)
+
+        self._on_camera_probe_started()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            resolutions = probe_supported_resolutions(
+                capture, on_candidate_tried=lambda _width, _height: QApplication.processEvents()
+            )
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._on_camera_probe_finished()
+
+        combo.blockSignals(True)
+        combo.clear()
+        combo.addItem("Auto (best available)", None)
+        combo.addItem("Auto (lowest available)", AUTO_LOWEST)
+        for width, height in resolutions:
+            combo.addItem(f"{width} × {height}", (width, height))
+        if isinstance(current_resolution, tuple) and current_resolution not in resolutions:
+            combo.addItem(f"{current_resolution[0]} × {current_resolution[1]} (not detected)", current_resolution)
+        target_index = combo.findData(current_resolution)
+        combo.setCurrentIndex(target_index if target_index >= 0 else 0)
+        combo.blockSignals(False)
+
+        # Probing above leaves the capture set to whichever candidate it tried last -- restore it
+        # to whatever is actually configured so the live preview doesn't stay on a stray mode.
+        if isinstance(current_resolution, tuple):
+            set_exact_resolution(capture, current_resolution)
+        elif current_resolution == AUTO_LOWEST:
+            set_lowest_available_resolution(capture)
+        else:
+            set_best_available_resolution(capture)
+
+    def _on_resolution_changed(self, side: str) -> None:
+        combo = self.face_resolution_combo if side == "face" else self.doc_resolution_combo
+        resolution = combo.currentData()
+        setting_key = "face_camera_resolution" if side == "face" else "doc_camera_resolution"
+        set_setting(self.conn, setting_key, resolution_to_setting_value(resolution))
+
+        if side == "face":
+            applied = self.camera_manager.set_face_camera_resolution(resolution)
+        else:
+            applied = self.camera_manager.set_doc_camera_resolution(resolution)
+        logger.info("Operator set the %s camera resolution to %s (applied %s)", side, resolution or "auto", applied)
+
+        # An exact resolution silently falls back to auto-best inside set_exact_resolution when
+        # the camera doesn't honor it (some hardware/drivers ignore CAP_PROP_FRAME_WIDTH/HEIGHT
+        # entirely and always deliver one fixed native mode) -- that fallback is otherwise only
+        # logged, which looks to an operator like their choice was ignored for no reason. Surface
+        # it here instead of leaving it silent.
+        if isinstance(resolution, tuple) and applied is not None and applied != resolution:
+            QMessageBox.warning(
+                self,
+                "Resolution not supported",
+                f"This camera did not accept {resolution[0]} × {resolution[1]} and is still "
+                f"using {applied[0]} × {applied[1]} instead. Click Refresh above to see the "
+                "resolutions this camera actually supports.",
+            )
 
     def _build_camera_combo(self, cameras: list[CameraInfo], current_index: int) -> QComboBox:
         combo = QComboBox()
@@ -466,14 +1001,18 @@ class SettingsWindow(QWidget):
     def _on_face_camera_changed(self, _list_index: int) -> None:
         new_index = self.face_camera_combo.currentData()
         set_setting(self.conn, "face_camera_index", str(new_index))
-        self.camera_manager.switch_face_camera(new_index)
+        self.camera_manager.switch_face_camera(new_index, get_face_camera_resolution(self.conn))
         logger.info("Operator reassigned the visitor (left) camera to index %d", new_index)
+        # A different physical device may support an entirely different set of resolutions --
+        # re-probe rather than leaving the combo showing the previous camera's list.
+        self._refresh_resolution_combo("face")
 
     def _on_doc_camera_changed(self, _list_index: int) -> None:
         new_index = self.doc_camera_combo.currentData()
         set_setting(self.conn, "doc_camera_index", str(new_index))
-        self.camera_manager.switch_doc_camera(new_index)
+        self.camera_manager.switch_doc_camera(new_index, get_doc_camera_resolution(self.conn))
         logger.info("Operator reassigned the identification (right) camera to index %d", new_index)
+        self._refresh_resolution_combo("doc")
 
     # -- Face match threshold -------------------------------------------------------------------
 
@@ -566,6 +1105,76 @@ class SettingsWindow(QWidget):
         set_setting(self.conn, "face_match_threshold", str(new_threshold))
         logger.info("Operator set the face match threshold to %.2f", new_threshold)
         QMessageBox.information(self, "Face match threshold", f"Face match threshold set to {new_threshold:.2f}.")
+
+    # -- Barcode/OCR overlap threshold ------------------------------------------------------------
+
+    def _build_barcode_overlap_threshold_group(self) -> QGroupBox:
+        group = QGroupBox("Barcode/OCR overlap threshold")
+        outer_layout = QVBoxLayout(group)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Minimum OCR/barcode word-overlap ratio to count as valid:"))
+
+        self.barcode_overlap_threshold_spin = QDoubleSpinBox()
+        self.barcode_overlap_threshold_spin.setRange(0.0, 1.0)
+        self.barcode_overlap_threshold_spin.setSingleStep(0.01)
+        self.barcode_overlap_threshold_spin.setDecimals(2)
+        self.barcode_overlap_threshold_spin.setValue(get_barcode_overlap_threshold(self.conn))
+        row.addWidget(self.barcode_overlap_threshold_spin)
+
+        save_button = QPushButton("Save")
+        save_button.clicked.connect(self._on_save_barcode_overlap_threshold_clicked)
+        row.addWidget(save_button)
+        row.addStretch(1)
+        outer_layout.addLayout(row)
+
+        info_label = QLabel(
+            "Only used for a document that has a decoded PDF417 barcode but no MRZ (mainly EU "
+            "driving licences -- see README Known limitations: field-level barcode parsing isn't "
+            "implemented, so this word-overlap ratio is the only cross-check available for those). "
+            "This is the fraction of OCR-read words that also appear in the raw barcode text; below "
+            "this ratio, the document's validation_status is 'review' instead of 'valid'. Not yet "
+            "calibrated against real captures at this desk (default 0.50) -- lower values are more "
+            "lenient (more likely 'valid' despite a noisy OCR read), higher values are stricter."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: gray;")
+        outer_layout.addWidget(info_label)
+
+        calibrate_row = QHBoxLayout()
+        calibrate_button = QPushButton("Calibrate...")
+        calibrate_button.clicked.connect(self._on_barcode_calibrate_clicked)
+        calibrate_row.addWidget(calibrate_button)
+        calibrate_row.addWidget(QLabel("Measure real overlap ratios from real document captures to pick a value above."))
+        calibrate_row.addStretch(1)
+        outer_layout.addLayout(calibrate_row)
+
+        return group
+
+    def _on_barcode_calibrate_clicked(self) -> None:
+        """Open the barcode/OCR calibration window, creating it once and reusing it on subsequent clicks."""
+        logger.info("Operator opened the barcode/OCR overlap calibration window")
+        if self._barcode_calibration_window is None:
+            self._barcode_calibration_window = BarcodeCalibrationWindow(
+                self.camera_manager, on_apply_threshold=self._on_barcode_calibration_threshold_applied
+            )
+        self._barcode_calibration_window.show()
+        self._barcode_calibration_window.raise_()
+        self._barcode_calibration_window.activateWindow()
+
+    def _on_barcode_calibration_threshold_applied(self, new_threshold: float) -> None:
+        """Persist a threshold suggested by the calibration window and reflect it in this window's own spinbox."""
+        set_setting(self.conn, "barcode_overlap_threshold", str(new_threshold))
+        logger.info("Operator applied a calibration-suggested barcode/OCR overlap threshold of %.4f", new_threshold)
+        self.barcode_overlap_threshold_spin.setValue(new_threshold)
+
+    def _on_save_barcode_overlap_threshold_clicked(self) -> None:
+        new_threshold = self.barcode_overlap_threshold_spin.value()
+        set_setting(self.conn, "barcode_overlap_threshold", str(new_threshold))
+        logger.info("Operator set the barcode/OCR overlap threshold to %.2f", new_threshold)
+        QMessageBox.information(
+            self, "Barcode/OCR overlap threshold", f"Barcode/OCR overlap threshold set to {new_threshold:.2f}."
+        )
 
     # -- Capture shortcut -----------------------------------------------------------------------
 

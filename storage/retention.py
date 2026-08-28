@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from config.settings import RETENTION_DAYS_NEVER, get_retention_days
-from storage.models import delete_scan, list_scans_older_than
+from storage.models import list_scans_older_than
 
 
 def purge_expired_scans(conn: sqlite3.Connection) -> int:
@@ -37,7 +37,13 @@ def purge_scans_older_than_days(conn: sqlite3.Connection, days: int) -> int:
     for scan in expired_scans:
         _delete_image_file_if_present(scan.face_image_path)
         _delete_image_file_if_present(scan.doc_image_path)
-        delete_scan(conn, scan.id)
+
+    # One statement + one commit for every expired row, rather than storage.models.delete_scan's
+    # own commit-per-call N times over -- N separate fsync'd transactions at startup whenever a
+    # backlog of scans has expired (e.g. after time away, or a newly shortened retention period)
+    # is a real, easily-avoided startup delay, since this purge is already one atomic unit of work.
+    conn.execute("DELETE FROM scans WHERE created_at < ?", (cutoff.isoformat(),))
+    conn.commit()
 
     return len(expired_scans)
 

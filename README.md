@@ -57,6 +57,52 @@ machine. This app calls it via `pytesseract`, which shells out to the binary.
   path above (see `prerequisites.py::check_tesseract`), so this manual step is only needed if
   Tesseract is installed somewhere else.
 
+#### OCR language packs
+
+Tesseract's default install only includes English (`eng.traineddata`) — this app runs OCR with
+that plus every language below loaded together (see `config/ocr_languages.py`), so a document in
+any of these languages OCRs its own accented characters correctly instead of silently misreading
+them as their plain unaccented equivalents (e.g. Swedish `Ö`/`Å`/`Ä` read as a bare `O`/`A`/`A`).
+Each language needs its own `.traineddata` file installed — downloading one does **not** cover
+any of the others:
+
+| Language   | Code  | File               |
+|------------|-------|--------------------|
+| Swedish    | `swe` | `swe.traineddata`  |
+| German     | `deu` | `deu.traineddata`  |
+| French     | `fra` | `fra.traineddata`  |
+| Spanish    | `spa` | `spa.traineddata`  |
+| Italian    | `ita` | `ita.traineddata`  |
+| Dutch      | `nld` | `nld.traineddata`  |
+| Portuguese | `por` | `por.traineddata`  |
+| Polish     | `pol` | `pol.traineddata`  |
+| Danish     | `dan` | `dan.traineddata`  |
+| Norwegian  | `nor` | `nor.traineddata`  |
+| Finnish    | `fin` | `fin.traineddata`  |
+
+> **Don't mix up "Dutch" and "German"/"Deutsch".** "Dutch" is the Netherlands' language
+> (`nld.traineddata`) — it is a different language from German (`deu.traineddata`), even though
+> "Dutch" sounds like the German word for German, "Deutsch". If a startup or Settings message
+> reports one of these missing, check the language *name* against the file name in the table
+> above before assuming which file to download.
+
+- **Check what's installed and what's missing**: Settings → Prerequisites → "OCR language
+  packs" → the info button shows a checklist of every language above with `[x]`/`[ ]` next to
+  each, and exactly which `.traineddata` file is missing for any unchecked one.
+- **Install automatically**: same dialog → "Install now" (fetches every missing pack from
+  https://github.com/tesseract-ocr/tessdata_fast). This writes into Tesseract's own `tessdata\`
+  folder (normally `C:\Program Files\Tesseract-OCR\tessdata\`), which needs administrator rights
+  if Tesseract was installed machine-wide — running the app as administrator once, or copying the
+  file(s) in manually as described below, both work.
+- **Install manually**: download the specific `.traineddata` file(s) you need from
+  https://github.com/tesseract-ocr/tessdata_fast and place them directly in the same `tessdata\`
+  folder Tesseract itself is installed in (see `prerequisites.py::_resolve_active_tessdata_dir`
+  for exactly which folder that is on your machine: the portable `tesseract\tessdata\` folder next
+  to the app if you're using one, else wherever `tesseract.exe` is found on `PATH`, else the
+  default `C:\Program Files\Tesseract-OCR\tessdata\`).
+- This check only runs once at startup — after adding a `.traineddata` file manually, restart the
+  app (or reopen Settings → Prerequisites) to see it picked up.
+
 ### 3. InsightFace face-recognition model (one-time download)
 
 Face detection and embedding use the InsightFace `buffalo_l` model pack (~330 MB). This
@@ -288,10 +334,17 @@ also documented as a code comment at the point where the database is opened (`st
   rather than only showing a hard pass/fail gate.
 - **PDF417 barcode support is not yet validated against a real Swedish driving licence
   sample.** The barcode decoder (`zxing-cpp`) is a general-purpose, actively maintained
-  PDF417 reader, but Swedish driving licence barcode encoding has not been confirmed to
-  match AAMVA-style (US) formats. Validate against a real sample before relying on this
-  path in production; a fallback pure-Python decoder (`pdf417decoder`) is listed
-  (commented out) in `requirements.txt` in case it proves necessary.
+  PDF417 reader, and its decoded text is confirmed to cross-check correctly against OCR
+  text either way, but Swedish driving licence barcode encoding specifically has not been
+  confirmed to match AAMVA-style (US/Canadian) formats, so no structured field-level
+  parsing is attempted for it (`barcode_parser.py` returns raw decoded text only in that
+  case). A US or Canadian driver's licence/ID card *does* get structured field-level
+  parsing (name, birth date, expiry, licence number, issuing state) — its PDF417 payload
+  follows AAMVA's published DL/ID Card Design Standard, not an unvalidated layout, so
+  `document/aamva_parser.py` can parse it deterministically. Validate the Swedish layout
+  against a real sample before relying on that path in production; a fallback pure-Python
+  decoder (`pdf417decoder`) is listed (commented out) in `requirements.txt` in case it
+  proves necessary.
 - **Documents without an MRZ or barcode are marked `unverifiable`, not `valid`.** Many
   countries' ID documents have no machine-readable zone and no barcode. For these, only
   OCR-extracted fields are available, with no independent source to cross-check them

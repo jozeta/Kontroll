@@ -5,8 +5,8 @@ import time
 import cv2
 import numpy as np
 
-_READ_RETRIES = 3
-_RETRY_DELAY_SECONDS = 0.05
+_READ_RETRIES = 5
+_RETRY_DELAY_SECONDS = 0.075
 
 
 def capture_still_frame(capture: cv2.VideoCapture) -> np.ndarray | None:

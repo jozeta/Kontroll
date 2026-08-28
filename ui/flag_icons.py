@@ -19,10 +19,14 @@ ICON_SIZE = (24, 16)
 
 _FALLBACK_COLOR = "#B0B0B0"
 
-# Each entry is ("stripes", orientation, [(color, weight), ...]) for equal or weighted stripes, or
+# Each entry is ("stripes", orientation, [(color, weight), ...]) for equal or weighted stripes,
 # ("nordic_cross", background_color, cross_color, border_color_or_None) for the offset-cross
-# Nordic flag design. Colors are standard flag reference hex values; stripe weights default to
-# equal (1) unless a real flag's proportions are visibly unequal (e.g. Spain, Portugal, Latvia).
+# Nordic flag design, or ("canton", stripe_color_a, stripe_color_b, stripe_count, canton_color) for
+# a horizontally-striped field with a solid-color rectangular canton in the top-left corner (the
+# US flag's layout, simplified to a plain canton block rather than 50 individual stars, which
+# would be illegible at this icon's size anyway). Colors are standard flag reference hex values;
+# stripe weights default to equal (1) unless a real flag's proportions are visibly unequal (e.g.
+# Spain, Portugal, Latvia).
 _FLAG_PATTERNS: dict[str, tuple] = {
     "SE": ("nordic_cross", "#006AA7", "#FECC02", None),
     "NO": ("nordic_cross", "#EF2B2D", "#FFFFFF", "#002868"),
@@ -48,6 +52,7 @@ _FLAG_PATTERNS: dict[str, tuple] = {
     "UA": ("stripes", "horizontal", [("#0057B7", 1), ("#FFD700", 1)]),
     "ES": ("stripes", "horizontal", [("#AA151B", 1), ("#F1BF00", 2), ("#AA151B", 1)]),
     "PT": ("stripes", "vertical", [("#046A38", 2), ("#DA291C", 3)]),
+    "US": ("canton", "#B22234", "#FFFFFF", 7, "#3C3B6E"),
 }
 
 
@@ -63,6 +68,19 @@ def _paint_stripes(painter: QPainter, rect: QRectF, orientation: str, stripes: l
             stripe_width = rect.width() * weight / total_weight
             painter.fillRect(QRectF(rect.left() + offset, rect.top(), stripe_width, rect.height()), QColor(color))
             offset += stripe_width
+
+
+def _paint_canton(painter: QPainter, rect: QRectF, stripe_color_a: str, stripe_color_b: str, stripe_count: int, canton_color: str) -> None:
+    stripe_height = rect.height() / stripe_count
+    for index in range(stripe_count):
+        color = stripe_color_a if index % 2 == 0 else stripe_color_b
+        painter.fillRect(QRectF(rect.left(), rect.top() + index * stripe_height, rect.width(), stripe_height), QColor(color))
+
+    # A canton spanning the top-left ~40% width / ~55% height, over whichever stripes fall
+    # beneath it -- proportions chosen to read clearly at this icon's small size, not to match
+    # the real flag's exact 50-star field dimensions.
+    canton_rect = QRectF(rect.left(), rect.top(), rect.width() * 0.4, rect.height() * 0.55)
+    painter.fillRect(canton_rect, QColor(canton_color))
 
 
 def _paint_nordic_cross(painter: QPainter, rect: QRectF, bg_color: str, cross_color: str, border_color: str | None) -> None:
@@ -87,8 +105,22 @@ def _paint_nordic_cross(painter: QPainter, rect: QRectF, bg_color: str, cross_co
     painter.fillRect(QRectF(rect.left(), rect.top() + horizontal_y, rect.width(), bar_thickness), QColor(cross_color))
 
 
+_icon_cache: dict[str, QPixmap] = {}
+
+
 def render_flag_icon(alpha2_code: str) -> QPixmap:
-    """Render a small colored flag icon for a recognized alpha-2 country code, or a neutral gray tile if its design isn't curated."""
+    """Render a small colored flag icon for a recognized alpha-2 country code, or a neutral gray tile if its design isn't curated.
+
+    Memoized by code -- there are only ~25 distinct icons ever drawn, but this is called once per
+    history row that has a recognized country, so without caching the same handful of icons get
+    redrawn with QPainter from scratch on every row build. QPixmap is safe to share this way: it's
+    implicitly-shared/copy-on-write in Qt, so handing the same cached instance to many QLabels via
+    setPixmap is the normal, intended usage, not a mutation hazard.
+    """
+    cached = _icon_cache.get(alpha2_code)
+    if cached is not None:
+        return cached
+
     pixmap = QPixmap(*ICON_SIZE)
     pixmap.fill(Qt.GlobalColor.transparent)
 
@@ -111,10 +143,14 @@ def render_flag_icon(alpha2_code: str) -> QPixmap:
     elif pattern[0] == "nordic_cross":
         _, bg_color, cross_color, border_color = pattern
         _paint_nordic_cross(painter, rect, bg_color, cross_color, border_color)
+    elif pattern[0] == "canton":
+        _, stripe_color_a, stripe_color_b, stripe_count, canton_color = pattern
+        _paint_canton(painter, rect, stripe_color_a, stripe_color_b, stripe_count, canton_color)
 
     painter.setPen(QPen(QColor(0, 0, 0, 60), 1))
     painter.setBrush(Qt.BrushStyle.NoBrush)
     painter.drawRect(rect.adjusted(0, 0, -1, -1))
     painter.end()
 
+    _icon_cache[alpha2_code] = pixmap
     return pixmap

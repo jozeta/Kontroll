@@ -115,6 +115,14 @@ def _complete_pending_relocation(config: dict, key: str, new_dir: Path) -> dict:
                 if not destination.exists():
                     shutil.move(str(item), str(destination))
         config[key] = str(new_dir)
+        # Recorded so a caller with DB access (main.py, once storage.db is available -- this
+        # module intentionally has none) can rewrite any absolute image paths stored in old scan
+        # rows from old_dir to new_dir. Without this, files physically move here but rows written
+        # before the move keep pointing at the old (now-empty) directory and their thumbnails
+        # start showing "No image" after the next restart. Popped (see pop_completed_relocation)
+        # once consumed so it doesn't get reapplied on a later run.
+        if old_dir.resolve() != new_dir.resolve():
+            config[f"completed_relocation_{key}"] = {"old": str(old_dir), "new": str(new_dir)}
         logger.info("Completed pending relocation of %s: %s -> %s", key, old_dir, new_dir)
     except OSError:
         logger.warning("Failed to move %s to %s; keeping %s", key, new_dir, old_dir, exc_info=True)
@@ -128,6 +136,22 @@ def request_dir_change(key: str, new_dir: Path) -> None:
     config = _read_bootstrap_config()
     config[f"pending_{key}"] = str(new_dir)
     _write_bootstrap_config(config)
+
+
+def pop_completed_relocation(key: str) -> tuple[Path, Path] | None:
+    """Return and clear the (old_dir, new_dir) pair for a just-completed relocation of this key, or None if none is pending consumption.
+
+    Meant to be called exactly once per relocation, after a DB connection is available, so the
+    caller can rewrite stale absolute image paths stored in old scan rows -- see the comment in
+    _complete_pending_relocation for why this two-step handoff exists (this module has no DB
+    access of its own).
+    """
+    config = _read_bootstrap_config()
+    record = config.pop(f"completed_relocation_{key}", None)
+    if record is None:
+        return None
+    _write_bootstrap_config(config)
+    return (Path(record["old"]), Path(record["new"]))
 
 
 def get_pending_dir_change(key: str) -> Path | None:
@@ -161,6 +185,20 @@ def get_documents_dir() -> Path:
 def get_logs_dir() -> Path:
     """Typed convenience accessor: the directory the log file lives in."""
     return get_configured_dir(LOGS_DIR_KEY)
+
+
+def get_flagged_images_dir() -> Path:
+    """Directory reference images for the operator-maintained flagged-persons watch list are stored in.
+
+    Deliberately not one of the four operator-configurable/relocatable directories above -- it's a
+    small, low-volume folder of manually-added entries (not a per-scan capture output), so it's
+    kept simple as a fixed subdirectory next to the faces folder rather than adding a fifth
+    relocation flow. It only follows the faces directory if that itself gets relocated (since it's
+    resolved fresh from get_faces_dir() every call), it is not itself independently relocatable.
+    """
+    flagged_dir = get_faces_dir().parent / "flagged"
+    flagged_dir.mkdir(parents=True, exist_ok=True)
+    return flagged_dir
 
 
 def ensure_configured_dirs_exist(parent: QWidget | None = None) -> None:

@@ -77,19 +77,29 @@ runs, in order:
    `embedder.py` picks the highest-confidence face and returns its 512-d normalized embedding;
    `matcher.py` computes cosine similarity against the configurable threshold and returns both
    the raw score and a bool — never just one or the other, since the UI must always show both.
-3. **Document pipeline** (`document/`): `image_quality.py` flags a blurry (Laplacian-variance
-   proxy) or glare-heavy capture first — passive only, shown as a banner on the scan's thumbnail,
-   never blocks or retries → `ocr.py` (Tesseract via pytesseract) → `mrz_parser.py` (locates
+3. **Document pipeline** (`document/`): `ocr.py::extract_words` runs first so `image_quality.py`
+   can flag a blurry (Laplacian-variance proxy), glare-heavy, low-resolution, or hard-to-read
+   (mean OCR word confidence too low) capture — passive only, shown as a banner on the scan's
+   thumbnail, never blocks or retries. `ocr.py::extract_text` (a second, separate Tesseract pass,
+   kept apart from `extract_words` since `image_to_data`'s per-word layout doesn't reliably
+   reproduce `image_to_string`'s spacing that MRZ/driving-licence field parsing depends on) then
+   feeds `mrz_parser.py` (locates
    MRZ-shaped lines by character set + fixed line width, then checksum-validates via the `mrz`
    library — TD1/30-char/3-line, TD2/36-char/2-line, TD3/44-char/2-line, widths are unique so
-   there's no format ambiguity) → `barcode_parser.py` (PDF417 only, via zxing-cpp, raw text only
-   — no structured field parsing, since the Swedish driving licence PDF417 layout is unvalidated
-   against a real sample) → `doc_classifier.py` (type/country from MRZ document code, or OCR
-   keyword fallback for barcode-only docs) → `field_crosscheck.py::determine_validation_status`
-   (the decision point for `validation_status`) and `field_crosscheck.py::check_person_flags`
-   (separate under-18/expired-document flags — see below). When no MRZ is found (e.g. a driving
+   there's no format ambiguity) → `barcode_parser.py` (PDF417 only, via zxing-cpp, raw decoded
+   text — no structured field parsing for a Swedish driving licence specifically, since that
+   layout is unvalidated against a real sample; a US/Canadian driver's licence or ID card's
+   payload *is* structurally parsed, by `aamva_parser.py`, since AAMVA is a published standard) →
+   `doc_classifier.py` (type/country from MRZ document code first, else a decoded AAMVA payload,
+   else OCR keyword fallback, else bare barcode presence) → `field_crosscheck.py::
+   determine_validation_status` (the decision point for `validation_status`) and
+   `field_crosscheck.py::check_person_flags` (separate under-18/expired-document flags — see
+   below). When no MRZ is found and the barcode didn't decode as AAMVA (e.g. an EU driving
    licence), `dl_field_parser.py` heuristically extracts name/birth-date/expiry-date from the OCR
-   text instead, anchored on the EU-harmonized numbered field layout (fields 1/2/3/4b).
+   text instead, anchored on the EU-harmonized numbered field layout (fields 1/2/3/4b) shared by
+   every EU/EEA member state's driving licence regardless of language. OCR itself runs Tesseract
+   with every supported document-issuing country's language pack loaded together (see
+   `config/ocr_languages.py`), not just English, so each country's own diacritics OCR correctly.
 4. **Persist**: both images saved to the face/document image directories resolved by
    `config/app_paths.py` (LOCALAPPDATA-based by default, independently operator-configurable —
    *not* a fixed `data/` path relative to the project), one row written via
@@ -217,5 +227,11 @@ explicitly opts into placing alongside the app, so resolving them relative to `s
   `ui/calibration_window.py` helps an operator pick a better face-match threshold from real
   same-desk samples, but ships no equivalent tool for the barcode/OCR threshold.
 - PDF417 field-level parsing for Swedish driving licences is not implemented (no real sample was
-  available to validate against) — `barcode_parser.py` returns raw decoded text only.
-- Curated flag icons (`ui/flag_icons.py`) cover ~24 countries; others show a neutral grey tile.
+  available to validate against) — `barcode_parser.py` returns raw decoded text only for that
+  case. US/Canadian driver's licences and ID cards *do* get field-level parsing, since their
+  PDF417 payload follows the published AAMVA standard rather than an unvalidated one — see
+  `document/aamva_parser.py`.
+- Curated flag icons (`ui/flag_icons.py`) cover ~25 countries (24 plus the US); others show a
+  neutral grey tile — this is cosmetic only, independent of which countries' documents the OCR/
+  MRZ/AAMVA/EU-driving-licence pipelines actually support (see `config/ocr_languages.py` for the
+  OCR language set and `document/doc_classifier.py` for supported document types).
