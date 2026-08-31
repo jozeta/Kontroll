@@ -3,7 +3,47 @@ flags in field_crosscheck.py) and UI display of extracted MRZ/driving-licence fi
 (ui/main_window.py).
 """
 
+import re
 from datetime import date, datetime
+
+# Shared by every OCR-heuristic field parser that has to pull a printed calendar date out of a raw
+# text line (document/dl_field_parser.py's field 3/4b lines, document/eu_id_card_parser.py's "Date
+# of birth"/"Date of expiry" label lines): multiple formats are tried since EU guidance specifies
+# dd.mm.yyyy but Swedish practice commonly prints ISO-style yyyy-mm-dd instead. The separator is a
+# character class and OPTIONAL (a '?', not required), because real captures have shown Tesseract
+# mangling the printed '.' between date components in several different ways -- dropped into a
+# plain space ("28.07.1981" -> "28.07 1981"), dropped entirely with the digits running together
+# ("18.12.1972" -> "18121972"), or dropped for only one of the two separators ("22.07.1968" ->
+# "2207 1968"). Making the separator optional handles all of these (and the normal, cleanly-
+# punctuated case) with one pattern each, rather than a combinatorial explosion of "which separator
+# was dropped where" variants. The day<=31/month<=12/year bounds in extract_date_from_line below are
+# what keep this from over-matching once separators are no longer required between every digit pair.
+_DATE_SEPARATOR = r"[-./ ]?"
+_DATE_LINE_PATTERNS = (
+    re.compile(rf"(\d{{4}}){_DATE_SEPARATOR}(\d{{2}}){_DATE_SEPARATOR}(\d{{2}})"),
+    re.compile(rf"(\d{{2}}){_DATE_SEPARATOR}(\d{{2}}){_DATE_SEPARATOR}(\d{{4}})"),
+)
+
+
+def extract_date_from_line(line: str) -> str | None:
+    """Pull an ISO 'YYYY-MM-DD' date out of a printed document field line, trying each supported date format in turn -- see _DATE_LINE_PATTERNS' comment for why both are needed and why the separator is optional."""
+    for pattern in _DATE_LINE_PATTERNS:
+        match = pattern.search(line)
+        if match is None:
+            continue
+        first, second, third = match.groups()
+        # The ISO pattern's groups are already (year, month, day); the other two are (day, month, year).
+        year, month, day = (first, second, third) if len(first) == 4 else (third, second, first)
+        # The year bound matters as much as the day/month one below, not just for plausibility: a
+        # caller's own capture line can run on to include the *next* printed field if OCR drops the
+        # line break between them (diagnosed in dl_field_parser.py's expiry-date line, where this
+        # bound is what stopped an unrelated card-number tail from being matched as a date instead
+        # of the real one earlier in the same line). 1900-2099 comfortably covers both a birth date
+        # and an expiry date for any document this app will see.
+        if not (1900 <= int(year) <= 2099 and 1 <= int(day) <= 31 and 1 <= int(month) <= 12):
+            continue
+        return f"{year}-{month}-{day}"
+    return None
 
 
 def _infer_full_year_for_past_date(two_digit_year: int) -> int:

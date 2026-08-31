@@ -46,6 +46,7 @@ _REQUIRED_PACKAGES = {
     "pytesseract": "pytesseract",
     "mrz": "mrz",
     "zxing-cpp": "zxingcpp",
+    "pygrabber": "pygrabber",
 }
 
 _TESSERACT_COMMON_INSTALL_PATH = Path(r"C:\Program Files\Tesseract-OCR\tesseract.exe")

@@ -33,7 +33,6 @@ from PyQt6.QtWidgets import (
 )
 
 from capture.camera_manager import CameraManager
-from capture.frame_capture import capture_still_frame
 from document.barcode_parser import decode_pdf417_barcodes
 from document.card_detector import detect_and_crop_card
 from document.field_crosscheck import compute_barcode_ocr_overlap_ratio
@@ -162,7 +161,7 @@ class BarcodeCalibrationWindow(QWidget):
         self._refresh_display()
 
     def _on_capture_document_clicked(self) -> None:
-        doc_frame = capture_still_frame(self.camera_manager.doc_capture)
+        doc_frame = self.camera_manager.get_doc_latest_frame()
         if doc_frame is None:
             QMessageBox.warning(self, "Capture failed", "Could not read a frame from the document camera. Try again.")
             return

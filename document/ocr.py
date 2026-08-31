@@ -47,6 +47,38 @@ _OCR_LANG = TESSERACT_LANG_STRING
 # through unvalidated).
 _GENERAL_OCR_CONFIG = "--psm 4 --dpi 300"
 
+# CLAHE (Contrast Limited Adaptive Histogram Equalization) tile grid size and clip limit --
+# normalizes local contrast for a genuinely over/under-exposed capture (the software-side
+# complement to capture/camera_manager.py's ExposureSettings, which fixes the capture itself at the
+# source). A plain global histogram-equalize was deliberately not used instead: it applies one
+# uniform gain across the whole card, fighting _preprocess_for_ocr's own adaptive threshold (already
+# local-neighborhood-based specifically to handle uneven lighting, see that function's docstring).
+# CLAHE's clip limit caps how far any one tile's contrast gets stretched, which is what keeps it
+# from amplifying noise the same uniform equalize would. Tile size 8x8 and clip limit 2.0 are
+# OpenCV's own commonly-used starting values for this kind of document/text preprocessing, not
+# calibrated specifically against this app's cameras.
+#
+# Applied conditionally, gated on _apply_clahe_if_low_contrast's own std-deviation check below --
+# NOT unconditionally on every capture. Verified with a real driving-licence capture (cropped from
+# an operator-reported over-bright production screenshot) plus synthetic over-/under-exposed
+# variants of it: CLAHE clearly helped once contrast was actually low (mean OCR word confidence
+# 26.5->35.9 on an overexposed variant, 33.8->45.7 on an underexposed one), but on that same
+# capture's original, already-reasonably-exposed contrast, applying it unconditionally *hurt*
+# (more low-confidence noise words, lower mean confidence) -- adaptiveThreshold's own local
+# thresholding already handles a normally-lit capture fine on its own. Gating on low contrast keeps
+# this strictly additive (an already-good capture's OCR is untouched) instead of a blanket change
+# that regresses the common case to fix the uncommon one.
+_CLAHE_CLIP_LIMIT = 2.0
+_CLAHE_TILE_GRID_SIZE = (8, 8)
+
+# Grayscale standard deviation below which a capture is considered low-contrast enough (whether
+# from over- or under-exposure -- both compress the pixel value range toward one end) to be worth
+# CLAHE-normalizing before thresholding. A normally-lit real capture measured ~116; simulated over-
+# and under-exposed variants of that same capture measured ~53 and ~31 respectively (see this
+# module's own verification above) -- 70 sits comfortably between the two without being so high it
+# would also catch a normal capture.
+_LOW_CONTRAST_STD_THRESHOLD = 70.0
+
 
 @dataclass
 class OcrWord:
@@ -70,7 +102,20 @@ def _preprocess_for_ocr(image: np.ndarray) -> np.ndarray:
     working capture in a side-by-side comparison across every real sample available.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    if gray.std() < _LOW_CONTRAST_STD_THRESHOLD:
+        clahe = cv2.createCLAHE(clipLimit=_CLAHE_CLIP_LIMIT, tileGridSize=_CLAHE_TILE_GRID_SIZE)
+        gray = clahe.apply(gray)
     return cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 15)
+
+
+def preview_ocr_preprocessing(image: np.ndarray) -> np.ndarray:
+    """Public wrapper around _preprocess_for_ocr, for a caller that wants to *show* the operator
+    exactly what Tesseract will actually see (grayscale, CLAHE-normalized if low-contrast, then
+    adaptive-thresholded) rather than run OCR itself -- see ui/image_viewer.py::ImageEditDialog's
+    "Preview: what OCR sees" toggle, which exists specifically because judging whether an edit
+    (brightness/contrast/sharpen/crop) actually helps OCR by eye on the original color image is
+    unreliable; showing the real preprocessed input makes that immediately visible instead."""
+    return _preprocess_for_ocr(image)
 
 
 def extract_text(image: np.ndarray) -> str:
@@ -131,8 +176,8 @@ def _ocr_quality_score(words: list[OcrWord]) -> float:
 _ORIENTATION_RETRY_SCORE_THRESHOLD = 2000.0
 
 
-def correct_text_orientation(image: np.ndarray) -> np.ndarray:
-    """Return image rotated to whichever of its 4 axis-aligned orientations OCRs best, or image unchanged if the original orientation already looks fine.
+def correct_text_orientation(image: np.ndarray) -> tuple[np.ndarray, list[OcrWord], str]:
+    """Return (oriented_image, words, text) for whichever of image's 4 axis-aligned orientations OCRs best -- image unchanged if the original orientation already looks fine.
 
     document/card_detector.py's crop only ever guarantees a landscape-shaped output, not which of
     the two landscape orientations (right-side-up or upside-down) is the readable one -- there's no
@@ -147,27 +192,37 @@ def correct_text_orientation(image: np.ndarray) -> np.ndarray:
     confidence rotated 90 degrees the other way. ID cards/driving licences captured closer to
     already-upright in the lightbox don't hit this.
 
-    Callers should use the returned image (not just this function's own OCR results) for
-    everything downstream that assumes an upright frame -- document/mrz_locator.py's MRZ-band
-    search and document/barcode_parser.py's decode both need the correctly-oriented image too, not
-    just a corrected text string for this one OCR pass.
+    Callers should use the returned image (not just the returned words/text) for everything
+    downstream that assumes an upright frame -- document/mrz_locator.py's MRZ-band search and
+    document/barcode_parser.py's decode both need the correctly-oriented image too. The words/text
+    are the exact extract_words_and_text() result already computed for the winning orientation
+    while scoring it -- returned so the caller (ui/main_window.py::_analyze_capture) can use them
+    directly instead of immediately re-running an identical OCR pass on the same image right after
+    this returns, which is what happened here previously (this function returned only the image,
+    and every caller needed extract_words_and_text() right afterward anyway) -- a real, silent,
+    guaranteed-on-every-single-capture extra Tesseract pass in the common (already-upright) case
+    specifically, since that path used to score orientation via extract_words() and then discard
+    the result.
 
     Tries the extra 3 rotations only when the first (unrotated) attempt scores poorly -- see
     _ORIENTATION_RETRY_SCORE_THRESHOLD -- so the common already-upright case (every lightbox
-    capture seen so far except the one that motivated this) pays no extra OCR cost at all.
+    capture seen so far except the one that motivated this) pays for exactly one OCR pass total,
+    not two.
     """
     best_image = image
-    best_score = _ocr_quality_score(extract_words(image))
+    best_words, best_text = extract_words_and_text(image)
+    best_score = _ocr_quality_score(best_words)
     if best_score >= _ORIENTATION_RETRY_SCORE_THRESHOLD:
-        return best_image
+        return best_image, best_words, best_text
 
     for rotation in (cv2.ROTATE_90_CLOCKWISE, cv2.ROTATE_180, cv2.ROTATE_90_COUNTERCLOCKWISE):
         rotated = cv2.rotate(image, rotation)
-        score = _ocr_quality_score(extract_words(rotated))
+        words, text = extract_words_and_text(rotated)
+        score = _ocr_quality_score(words)
         if score > best_score:
-            best_image, best_score = rotated, score
+            best_image, best_words, best_text, best_score = rotated, words, text, score
 
-    return best_image
+    return best_image, best_words, best_text
 
 
 # MRZ lines use only these characters (ICAO 9303) -- restricting Tesseract's whitelist to exactly

@@ -68,6 +68,15 @@ def _configure_logging() -> None:
     sys.excepthook = _log_uncaught_exception
 
 
+def apply_debug_logging_setting(enabled: bool) -> None:
+    """Switch the root logger between INFO and DEBUG -- called once at startup (see main(), after
+    the settings DB is available) and again live from ui/settings_window.py's General tab toggle,
+    so an operator can turn on verbose logging to diagnose a reported issue without restarting.
+    """
+    logging.getLogger().setLevel(logging.DEBUG if enabled else logging.INFO)
+    logger.info("Debug logging %s", "enabled" if enabled else "disabled")
+
+
 def main() -> None:
     """Bootstrap the app: check prerequisites, initialize storage, purge expired scans, load the face model, and launch the UI."""
     _configure_logging()
@@ -105,11 +114,20 @@ def main() -> None:
     # top of the prerequisite dialog with no way to answer it.
     run_prerequisite_check(splash)
 
-    from capture.camera_manager import CameraManager
+    from capture.camera_manager import CameraManager, ExposureSettings
     from config.settings import (
         ensure_default_settings,
+        get_debug_logging_enabled,
+        get_doc_camera_auto_exposure,
+        get_doc_camera_backend,
+        get_doc_camera_brightness,
+        get_doc_camera_exposure,
         get_doc_camera_index,
         get_doc_camera_resolution,
+        get_face_camera_auto_exposure,
+        get_face_camera_backend,
+        get_face_camera_brightness,
+        get_face_camera_exposure,
         get_face_camera_index,
         get_face_camera_resolution,
         get_theme,
@@ -124,6 +142,7 @@ def main() -> None:
     conn = get_connection()
     initialize_schema(conn)
     ensure_default_settings(conn)
+    apply_debug_logging_setting(get_debug_logging_enabled(conn))
 
     # ensure_configured_dirs_exist() above already moved any relocated faces/documents folder's
     # files on disk, but had no DB connection yet to fix up scan rows saved before the move --
@@ -165,6 +184,18 @@ def main() -> None:
         doc_camera_index=get_doc_camera_index(conn),
         face_resolution=get_face_camera_resolution(conn),
         doc_resolution=get_doc_camera_resolution(conn),
+        face_exposure=ExposureSettings(
+            auto=get_face_camera_auto_exposure(conn),
+            exposure=get_face_camera_exposure(conn),
+            brightness=get_face_camera_brightness(conn),
+        ),
+        doc_exposure=ExposureSettings(
+            auto=get_doc_camera_auto_exposure(conn),
+            exposure=get_doc_camera_exposure(conn),
+            brightness=get_doc_camera_brightness(conn),
+        ),
+        face_backend=get_face_camera_backend(conn),
+        doc_backend=get_doc_camera_backend(conn),
     )
 
     window = MainWindow(conn, camera_manager, face_analysis_app)

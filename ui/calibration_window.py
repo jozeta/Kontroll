@@ -25,7 +25,6 @@ from PyQt6.QtWidgets import (
 from insightface.app import FaceAnalysis
 
 from capture.camera_manager import CameraManager
-from capture.frame_capture import capture_still_frame
 from config.settings import set_setting
 from face.detector import detect_faces
 from face.embedder import get_best_face_embedding
@@ -154,8 +153,8 @@ class CalibrationWindow(QWidget):
         self._refresh_display()
 
     def _on_capture_pair_clicked(self) -> None:
-        face_frame = capture_still_frame(self.camera_manager.face_capture)
-        doc_frame = capture_still_frame(self.camera_manager.doc_capture)
+        face_frame = self.camera_manager.get_face_latest_frame()
+        doc_frame = self.camera_manager.get_doc_latest_frame()
         if face_frame is None or doc_frame is None:
             QMessageBox.warning(self, "Capture failed", "Could not read a frame from one or both cameras. Try again.")
             return

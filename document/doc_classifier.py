@@ -101,6 +101,41 @@ def _classify_from_ocr_keywords(ocr_text: str) -> DocumentClassification | None:
     if "IDENTITETSKORT" in normalized_text:
         return DocumentClassification(doc_type="national_id", doc_country="SWE", classified_from="ocr_keywords")
 
+    # Each of these is that country's own official printed title for its national ID card (not a
+    # guessed layout) -- same "factual translation, not an assumed layout" rigor as
+    # drivers_licence_keywords above. Apostrophe variants are listed alongside the plain form since
+    # OCR has been observed dropping/mangling apostrophes elsewhere in this app (see
+    # dl_field_parser.py's own comments on this). Checked ahead of the generic 'IDENTITY CARD'
+    # fallback below, so a specific country match always wins over the country-less generic one.
+    # See document/eu_id_card_parser.py for the OCR-only field extraction that follows from this
+    # (or from the generic fallback) for any of these, once MRZ reading has failed/found nothing --
+    # front-only captures are the common case at a desk, same as the Swedish national ID above.
+    national_id_keywords: tuple[tuple[str, str | None], ...] = (
+        ("PERSONALAUSWEIS", "DEU"),
+        ("CARTE NATIONALE D'IDENTITE", "FRA"), ("CARTE NATIONALE D IDENTITE", "FRA"),
+        ("CARTE D'IDENTITE", "FRA"), ("CARTE D IDENTITE", "FRA"),
+        ("CARTA D'IDENTITA", "ITA"), ("CARTA D IDENTITA", "ITA"),
+        ("DOCUMENTO NACIONAL DE IDENTIDAD", "ESP"),
+        ("DOWÓD OSOBISTY", "POL"), ("DOWOD OSOBISTY", "POL"),
+        ("CARTÃO DE CIDADÃO", "PRT"), ("CARTAO DE CIDADAO", "PRT"),
+        ("IDENTITEITSKAART", "NLD"),
+        ("HENKILÖKORTTI", "FIN"), ("HENKILOKORTTI", "FIN"),
+    )
+    for keyword, doc_country in national_id_keywords:
+        if keyword in normalized_text:
+            return DocumentClassification(doc_type="national_id", doc_country=doc_country, classified_from="ocr_keywords")
+
+    # Generic fallback for any other EU/EEA national ID card whose specific title isn't in the
+    # table above (or OCR'd too badly to match one) -- 'IDENTITY CARD' is the EU-regulation-
+    # mandated English secondary label on every member state's card (see
+    # document/eu_id_card_parser.py's module docstring for the regulation reference), so its
+    # presence alone is still a reasonable "this is *a* national ID card" signal even with no
+    # country attached, same as 'DRIVING LICENCE'/'DRIVING LICENSE' (doc_country=None) above.
+    # Checked last, and never for a Swedish card specifically -- 'IDENTITY CARD' is printed on
+    # Swedish cards too, but IDENTITETSKORT above already claims those before this is reached.
+    if "IDENTITY CARD" in normalized_text:
+        return DocumentClassification(doc_type="national_id", doc_country=None, classified_from="ocr_keywords")
+
     # 'PASSPORT'/'PASSEPORT' are the ICAO-mandated bilingual (English/French) heading printed on
     # every passport regardless of issuing country, so unlike the Sweden-specific keywords above,
     # their presence alone doesn't imply a Swedish passport -- only set doc_country when a bare

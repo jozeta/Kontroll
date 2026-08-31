@@ -25,6 +25,8 @@ flagged-persons list.
 import re
 from dataclasses import dataclass, field
 
+from document.dates import extract_date_from_line
+
 
 @dataclass
 class DlFieldsResult:
@@ -87,46 +89,6 @@ _EXPIRY_LINE_PATTERN = re.compile(r"(?m)^.{0,8}?4b[.:]?\s*(.*\d.*)$")
 # exact field on an otherwise clean OCR pass (every other field read correctly) twice in a row.
 _PERSONAL_NUMBER_PATTERN = re.compile(r"(?m)^.{0,8}?[5§][.:]?\s*(\d{6})[-+.\s]+(\d{4})")
 
-# Used for both the date-of-birth line (field 3) and the expiry-date line (field 4b); multiple
-# formats are tried since EU guidance specifies dd.mm.yyyy but Swedish practice commonly prints
-# ISO-style yyyy-mm-dd instead. The separator is a character class and OPTIONAL (a '?', not
-# required), because real captures have shown Tesseract mangling the printed '.' between date
-# components in several different ways -- dropped into a plain space ("28.07.1981" -> "28.07
-# 1981"), dropped entirely with the digits running together ("18.12.1972" -> "18121972"), or
-# dropped for only one of the two separators ("22.07.1968" -> "2207 1968"). Making the separator
-# optional handles all of these (and the normal, cleanly-punctuated case) with one pattern each,
-# rather than a combinatorial explosion of "which separator was dropped where" variants. The
-# day<=31/month<=12 sanity check below is what keeps this from over-matching once separators are
-# no longer required between every digit pair.
-_DATE_SEPARATOR = r"[-./ ]?"
-_DATE_PATTERNS = (
-    re.compile(rf"(\d{{4}}){_DATE_SEPARATOR}(\d{{2}}){_DATE_SEPARATOR}(\d{{2}})"),
-    re.compile(rf"(\d{{2}}){_DATE_SEPARATOR}(\d{{2}}){_DATE_SEPARATOR}(\d{{4}})"),
-)
-
-
-def _extract_date(line: str) -> str | None:
-    """Pull an ISO 'YYYY-MM-DD' date out of a driving licence field line, trying each supported date format in turn."""
-    for pattern in _DATE_PATTERNS:
-        match = pattern.search(line)
-        if match is None:
-            continue
-        first, second, third = match.groups()
-        # The ISO pattern's groups are already (year, month, day); the other two are (day, month, year).
-        year, month, day = (first, second, third) if len(first) == 4 else (third, second, first)
-        # The year bound matters as much as the day/month one below, not just for plausibility:
-        # _EXPIRY_LINE_PATTERN's capture runs to the end of the physical line, which on a real
-        # capture included the *next* printed field ("4b. 31 08 2026 4d. 863510077") once OCR
-        # dropped the line break between them. Without a year bound, the YYYY-MM-DD pattern above
-        # happily matched "8635-10-07" out of the card-number tail (8635/10/07 all pass the day/
-        # month check) and returned that instead of ever trying the DD-MM-YYYY pattern against the
-        # real "31 08 2026" earlier in the same line. 1900-2099 comfortably covers both a birth
-        # date and an expiry date for any document this app will see.
-        if not (1900 <= int(year) <= 2099 and 1 <= int(day) <= 31 and 1 <= int(month) <= 12):
-            continue
-        return f"{year}-{month}-{day}"
-    return None
-
 
 def parse_driving_licence_fields(ocr_text: str) -> DlFieldsResult:
     """Best-effort extraction of surname, given name(s), birth date, and expiry date from a driving licence's raw OCR text."""
@@ -142,15 +104,25 @@ def parse_driving_licence_fields(ocr_text: str) -> DlFieldsResult:
     if given_name_match:
         fields["name"] = given_name_match.group(1).strip()
     if birth_line_match:
-        birth_date = _extract_date(birth_line_match.group(1))
+        birth_date = extract_date_from_line(birth_line_match.group(1))
         if birth_date:
             fields["birth_date"] = birth_date
     if expiry_line_match:
-        expiry_date = _extract_date(expiry_line_match.group(1))
+        expiry_date = extract_date_from_line(expiry_line_match.group(1))
         if expiry_date:
             fields["expiry_date"] = expiry_date
     if personal_number_match:
         personal_number_digits, personal_number_suffix = personal_number_match.groups()
         fields["personal_number"] = f"{personal_number_digits}-{personal_number_suffix}"
+        if "birth_date" not in fields:
+            # Field 3 (the printed date-of-birth line) and field 5 (personnummer) are OCR'd and
+            # matched independently above -- a real capture can have field 3's line come out too
+            # garbled for extract_date_from_line to recover while field 5 still reads cleanly. A Swedish
+            # personnummer's own first 6 digits are its holder's YYMMDD birth date (the same
+            # encoding document/national_id_parser.py already derives birth_date from directly,
+            # rather than separately OCR'd), so that's used here as a fallback source rather than
+            # leaving birth_date -- and the DOB/age/is_minor flag that depends on it -- unpopulated
+            # when the personnummer alone would have been enough.
+            fields["birth_date"] = personal_number_digits
 
     return DlFieldsResult(found=bool(fields), fields=fields)

@@ -7,5 +7,6 @@ insightface==1.0.1
 pytesseract==0.3.13
 mrz==0.6.2
 zxing-cpp==3.1.1
+pygrabber==0.2  # precise DirectShow native-format enumeration/selection -- see capture/dshow_native_formats.py
 # pdf417decoder==1.0.8  # fallback pure-Python PDF417 decoder if zxing-cpp's PDF417 mode
                          # proves inadequate against real Swedish driving licence samples (Stage 5)

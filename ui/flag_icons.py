@@ -12,7 +12,9 @@ tile with the code itself drawn on it (e.g. "PL") instead of a guessed or wrong-
 design -- still identifies the country at a glance without pretending to be real flag art.
 """
 
-from PyQt6.QtCore import QRectF, Qt
+import base64
+
+from PyQt6.QtCore import QBuffer, QIODevice, QRectF, Qt
 from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap
 
 ICON_SIZE = (24, 16)
@@ -154,3 +156,26 @@ def render_flag_icon(alpha2_code: str) -> QPixmap:
 
     _icon_cache[alpha2_code] = pixmap
     return pixmap
+
+
+_data_uri_cache: dict[str, str] = {}
+
+
+def flag_icon_data_uri(alpha2_code: str) -> str:
+    """Same flag art as render_flag_icon, encoded as a base64 PNG data URI for embedding directly
+    in generated HTML (see ui/statistics_export.py's nationality breakdown chart) -- reuses the
+    exact same drawing instead of re-implementing every flag pattern a second time in SVG, so the
+    printed report and the on-screen chart never disagree on what a country's flag looks like.
+    """
+    cached = _data_uri_cache.get(alpha2_code)
+    if cached is not None:
+        return cached
+
+    buffer = QBuffer()
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    render_flag_icon(alpha2_code).save(buffer, "PNG")
+    encoded = base64.b64encode(bytes(buffer.data())).decode("ascii")
+    data_uri = f"data:image/png;base64,{encoded}"
+
+    _data_uri_cache[alpha2_code] = data_uri
+    return data_uri

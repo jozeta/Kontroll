@@ -66,11 +66,16 @@ either file defeats the point of the checker.
 
 ### Pipeline flow
 
-A single "Capture & Process" button click (`ui/main_window.py:_on_capture_and_process_clicked`)
-runs, in order:
+A single "Capture" button click (`ui/main_window.py::MainWindow._on_capture_and_process_clicked` →
+`_run_capture_and_process`) grabs a still frame from both cameras and immediately runs the full
+pipeline below on a background thread (`_start_capture_analysis`/`_CaptureAnalysisWorker`), saving
+the scan as soon as it finishes -- there is no operator review/crop step in between, and the live
+preview is never frozen (see "Capture flow: immediate save, no review step" below for why and what
+replaced the old review UI). The steps run, in order:
 
-1. **Capture** (`capture/frame_capture.py`): grab one still frame from each of the two camera
-   handles owned by `capture/camera_manager.py::CameraManager`.
+1. **Capture**: `capture/camera_manager.py::CameraManager.get_face_latest_frame()`/
+   `get_doc_latest_frame()` return whichever frame each camera's own background reader thread most
+   recently read (see "Camera frame reading" below) -- this never itself blocks on camera hardware.
 2. **Face pipeline** (`face/`): `detector.py` wraps a single shared
    `insightface.app.FaceAnalysis(name="buffalo_l")` instance (loaded once at startup — expensive,
    never reloaded per-scan) to detect faces in both the live frame and the document frame;
@@ -97,13 +102,247 @@ runs, in order:
    below). When no MRZ is found and the barcode didn't decode as AAMVA (e.g. an EU driving
    licence), `dl_field_parser.py` heuristically extracts name/birth-date/expiry-date from the OCR
    text instead, anchored on the EU-harmonized numbered field layout (fields 1/2/3/4b) shared by
-   every EU/EEA member state's driving licence regardless of language. OCR itself runs Tesseract
+   every EU/EEA member state's driving licence regardless of language; if the printed date-of-birth
+   line itself didn't OCR cleanly, birth date falls back to the first 6 digits of field 5's
+   Swedish personnummer (Sweden-specific, same YYMMDD encoding `national_id_parser.py` already
+   derives birth date from directly — see that module). For a `national_id`-classified document,
+   `national_id_parser.py` (Sweden, anchored on the card's own reliably-OCR'd title) is tried
+   first regardless of detected country; if it finds nothing, `eu_id_card_parser.py` is the
+   fallback for every other EU/EEA member state's national ID card, anchored on the English field
+   labels EU Regulation 2019/1157 has mandated on every member state's card since August 2021
+   ('Surname', 'Given name(s)', 'Nationality', 'Date of birth', 'Date of expiry') rather than a
+   per-country translated-label table — its own extracted `nationality` field (an ICAO alpha-3
+   code) also backfills `doc_country` in `ui/main_window.py::_analyze_capture` when
+   `doc_classifier.py`'s title-keyword match didn't already resolve one. OCR itself runs Tesseract
    with every supported document-issuing country's language pack loaded together (see
-   `config/ocr_languages.py`), not just English, so each country's own diacritics OCR correctly.
+   `config/ocr_languages.py`), not just English, so each country's own diacritics OCR correctly;
+   `document/ocr.py::_preprocess_for_ocr` also conditionally runs CLAHE contrast normalization
+   before thresholding when the captured frame's grayscale standard deviation is low enough to
+   indicate a genuinely over/under-exposed capture (a normally-exposed capture skips it entirely,
+   verified not to regress that common case — see that function's own comments for the exact
+   threshold and how it was derived).
 4. **Persist**: both images saved to the face/document image directories resolved by
    `config/app_paths.py` (LOCALAPPDATA-based by default, independently operator-configurable —
    *not* a fixed `data/` path relative to the project), one row written via
    `storage/models.py::insert_scan`, then prepended to the on-screen history list.
+
+### Capture flow: immediate save, no review step
+
+Capture used to freeze both live previews on every click so the operator could optionally draw a
+crop box on the document image before an explicit Save committed it — diagnosed as adding an
+unwanted pause to every single capture when most don't need cropping at all. `MainWindow` now runs
+the whole pipeline above immediately off the Capture click (`_run_capture_and_process` →
+`_start_capture_analysis` → `_finish_save_capture`, all on a background `QThread` — see that
+method's own docstring) with the live preview never paused (`_update_previews` runs unconditionally
+on its `QTimer` now); `_is_processing` still guards against a re-entrant click firing a second,
+overlapping capture while one is still being analyzed. Cropping and brightness/contrast correction
+moved to an explicit, occasional post-hoc action instead: double-click a saved face/document
+thumbnail to open `ui/image_viewer.py::ImageViewerWindow`, then its "Edit image…" button opens
+`ImageEditDialog` — crop (with scroll-wheel zoom via `_CropZoomView`, mirroring
+`ImageViewerWindow`'s own zoom/pan interaction), brightness/contrast/sharpen/black-and-white
+controls grouped in their own titled "Adjustments" box (visually separated from the image preview
+above rather than a bare stack of rows crowding it), a "Preview: what OCR sees" toggle (swaps the
+display for the literal preprocessed image `document/ocr.py::preview_ocr_preprocessing` produces,
+since judging whether an edit helps OCR by eye on the color original is unreliable), and (document
+images only, see below) a field-check panel that runs the real document classification +
+field-extraction pipeline against the current adjusted-and-cropped image and shows a side-by-side
+"Original (saved) / New (this image)" comparison of the identity fields found (surname, personal
+number, dates, ...), a changed value highlighted (debounced ~700ms after the last change, or on
+demand via "Test extraction now") — all applied in place to the scan's saved image file. The
+field-check pipeline is `document/field_extraction.py::extract_document_fields` — extracted out of
+`ui/main_window.py::_analyze_capture` (its original home) into its own module specifically so this
+dialog and the real capture pipeline can never independently drift apart on what a given image
+extracts to; `_analyze_capture` now just calls it and handles face-matching/crosscheck/flags
+separately. Omitted entirely for a face image (`kind="face"`), which has no document fields to
+extract. All edits run against the full-resolution saved file (`cv2.imread(image_path)`), never a
+downscaled copy; the black-and-white checkbox converts to grayscale then back to 3-channel BGR
+(`cv2.cvtColor` round-trip) so every downstream consumer -- crop-bounds math, the pixmap converter,
+`cv2.imwrite` -- keeps working against a plain BGR frame with no separate code path.
+
+The dialog itself is resizable (previously fixed to its own `sizeHint()`, cramping the controls
+against a small fixed-size image canvas) — `_CropZoomView` now adopts the same "base pixmap at
+full/native resolution, zoom level 1.0 means fitted-to-viewport" architecture
+`ImageViewerWindow`'s own `_ZoomableImageView` already used (`_fit_scale`/`_display_scale`, plus a
+`resizeEvent` that keeps the same content centered across a resize), rather than pre-shrinking the
+adjusted image to a small fixed preview size before ever handing it to the view. That pre-shrink
+was the actual root cause of the editor's brightness/contrast/sharpen preview looking pixelated —
+scroll-wheel zoom was upscaling an already-downscaled copy, not revealing real pixel detail from
+the source; confirmed via a real synthetic high-resolution capture that the view's base pixmap
+now matches the source image's own resolution exactly, with real magnification (not
+Qt-interpolated fake detail) available past "fitted". The dialog also opens already zoomed in on
+the detected face/card region (reusing the same `_find_zoom_bbox` detection `ImageViewerWindow`'s
+own auto-zoom uses) rather than the whole captured frame, since a document capture in particular
+commonly frames the whole light-box/desk area with the card itself occupying only a modest
+fraction of it. `_find_zoom_bbox` pads whatever `document/card_detector.py::find_card_bounding_box`
+finds by `_CARD_ZOOM_MARGIN_RATIO` (25%, via the shared `_expand_bbox_with_margin` helper also used
+for the face case's own margin) before computing the zoom -- confirmed against a real operator
+report that a zoom computed to exactly touch the detected box's edges left zero tolerance for any
+detection imprecision (a slightly rotated card, a brightness-threshold edge that undershoots by a
+few percent), visibly clipping the bottom of the card on open; this margin is purely extra
+preview-framing headroom, separate from `find_card_bounding_box`'s own much smaller (6%)
+pixel-precision margin used for the actual OCR crop. `_CropZoomView` also supports right-mouse-
+button drag panning (`_panning`/`_pan_start_pos`/`_pan_start_scroll`, mirroring
+`_ZoomableImageView`'s left-button pan) alongside its existing left-button crop-drag, so both are
+available at once with no mode toggle. The field-check panel's text area is a fixed-height
+(`_FIELD_CHECK_PANEL_HEIGHT`) `QScrollArea`, not a plain label -- diagnosed against a real
+operator report that the label's content alternates between a short "waiting for changes to
+settle…" line and a multi-row comparison table as sliders are dragged, and without a fixed height
+that swing in required layout height forced the whole (resizable) dialog window to visibly grow
+and shrink on every single slider tick; a longer table now simply scrolls internally instead. The
+very first edit to a given image copies the original aside to
+`<name>.original<ext>` first (only if that backup doesn't already exist) so the source capture is
+never destructively lost. Applying an edit offers to re-analyze the scan with the corrected image,
+reusing the exact same `_start_capture_analysis` pipeline `HistoryRowWidget`'s own "Re-analyze"
+button already calls (via `on_reanalyze`, threaded down from `MainWindow._on_reanalyze_scan_requested`
+through `HistoryRowWidget`/`ClickableThumbnailLabel`/`ImageViewerWindow`) — no separate re-analyze
+logic exists for an edited image.
+
+### Camera frame reading and exposure (`capture/camera_manager.py`)
+
+Diagnosed from a production `app.log`: a camera that falls back to an uncompressed capture format
+(see `_open_camera`'s own MJPG comment) can take up to ~1s per `capture.read()` call once
+bandwidth-throttled over USB. Previously this call happened directly on `ui/main_window.py`'s
+~30fps preview `QTimer` callback — the main GUI thread — so a throttled camera froze the entire UI
+for however long each read took. Each camera's `capture.read()` now runs continuously on its own
+daemon background thread (`_CameraReaderThread`); `CameraManager.read_face_preview_frame`/
+`read_doc_preview_frame` (the live preview) and `get_face_latest_frame`/`get_doc_latest_frame` (the
+Capture button's still-frame grab, replacing the old `capture/frame_capture.py::capture_still_frame`
+retry-loop approach — a continuously-refreshed buffer makes a one-off dropped read invisible to the
+consumer without needing its own retry) are now just non-blocking getters over that thread's latest
+buffered frame. `CameraManager.pause_readers()`/`resume_readers()` (called from
+`MainWindow._pause_camera_previews`/`_resume_camera_previews`) must bracket any *direct* access to
+`camera_manager.face_capture`/`doc_capture` from another thread — resolution probing, diagnostics
+export, exposure changes in `ui/settings_window.py` — since DirectShow handles aren't documented
+safe for concurrent access; `pause_readers()` blocks until any read already in flight finishes
+before returning, so it's always safe to touch the raw capture immediately afterward.
+
+Each camera also has operator-configurable exposure settings (`ExposureSettings`: auto, or a manual
+exposure/brightness pair in DirectShow's own native units) — default is auto, matching how both
+cameras were found configured in production; a manual override is applied via
+`CameraManager.set_face_camera_exposure`/`set_doc_camera_exposure`, persisted under the
+`face_camera_auto_exposure`/`face_camera_exposure`/`face_camera_brightness` settings keys (and the
+`doc_camera_*` equivalents — see `config/settings.py`), and exposed as a checkbox plus two sliders
+per camera in Settings → Cameras. Not every camera/driver honors manual exposure control — same
+accepted-limitation pattern as `set_exact_resolution`'s own resolution fallback.
+
+**Compression varies by resolution, not just by camera.** Diagnosed against a real operator report:
+a camera that streams smoothly at full resolution in other applications still fell back to
+uncompressed YUY2 in this app at every resolution it was tried at. `probe_supported_resolutions`
+now reads back the negotiated FourCC *at each candidate resolution* (`_apply_resolution_and_get_
+fourcc`), not just once at camera-open time — plenty of real UVC webcams only expose MJPG below
+their sensor's native/highest mode. `set_best_available_resolution`/`set_lowest_available_
+resolution` (`_best_candidate_preferring_compression`) now prefer the highest/lowest candidate that
+*also* keeps MJPG over one that doesn't, even if that means a resolution a step down from the
+outright highest; the Settings resolution dropdown and diagnostics export both show each
+resolution's negotiated compression (`ui/settings_window.py::_resolution_compression_label`).
+
+**Capture backend is now per-camera configurable** (`CameraManager.set_face_camera_backend`/
+`set_doc_camera_backend`, persisted under `face_camera_backend`/`doc_camera_backend`, values from
+`capture.camera_manager.CAMERA_BACKENDS`) — DirectShow stays the app-wide default (see
+`enumerate_cameras`' own comment for why it's used for *enumeration* specifically), but Media
+Foundation is offered as a per-camera opt-in alternative in Settings → Cameras, since DirectShow's
+MJPG negotiation is a known-flaky OpenCV/Windows quirk on some camera/driver combinations that
+Media Foundation often handles more reliably — exactly the mismatch a camera behaving fine in
+other (typically Media-Foundation-or-native-SDK-based) applications but not this one suggests.
+Caveat documented in `_open_camera`'s own docstring: DirectShow's and Media Foundation's device-index
+numbering aren't guaranteed to agree on a system with several cameras attached, since
+`enumerate_cameras` always probes via DSHOW — switching a specific camera's backend could in
+principle open a different physical device at the same index; this is immediately obvious from the
+live preview if it happens, and easy to revert.
+
+**Backend switching is retried, verified, and self-healing** (`_open_camera_verified`,
+`_BACKEND_SWITCH_RELEASE_DELAY_SECONDS`/`_BACKEND_SWITCH_RETRY_ATTEMPTS`) — diagnosed from a real
+operator report: switching a camera to Media Foundation and back to DirectShow left it unable to
+come back online at all. A UVC device doesn't always finish releasing from one capture API before a
+*different* one tries to claim it right after; the original single-attempt-with-no-delay
+`_open_camera` call could get back a handle that reports `isOpened()` but never actually delivers a
+frame, and nothing verified, retried, or fell back, so that broken handle was simply kept forever.
+`set_face_camera_backend`/`set_doc_camera_backend` now insert a short settling delay before
+(re)opening under a different backend, retry a few times, and — if the newly requested backend
+still doesn't deliver a frame — automatically revert to whichever backend was last known to work,
+returning `(succeeded, backend_now_in_effect)` so `ui/settings_window.py::_on_backend_changed` can
+persist/display whichever backend is *actually* in effect (which may not be the one the operator
+picked) and tell them if it had to fall back. This only applies to genuine backend switches, not the
+routine reconnect-after-read-failures path (`_reopen_face_camera`/`_reopen_doc_camera`), which
+
+**The switch itself runs on a background thread** (`ui/settings_window.py::_BackendSwitchWorker`,
+mirroring `ui/main_window.py`'s `_CaptureAnalysisWorker`/`QThread` pattern) — diagnosed against a
+real operator report that the whole app froze for a long time switching back to DirectShow. The
+retry/settling-delay machinery above can legitimately take several real seconds of blocking
+hardware I/O; running it directly on `_on_backend_changed`'s own (UI) thread, as the very first cut
+of this feature did, blocked the entire app for that whole span. The affected combo is disabled
+(and the live preview paused, via the existing `_on_camera_probe_started`/`_on_camera_probe_
+finished` callbacks) for the duration, both lifted once the worker's `finished` signal delivers the
+result to `_finish_backend_switch` back on the main thread. `MainWindow.closeEvent` also now
+declines to close (matching its existing guard for an in-progress capture/re-analysis) while
+`SettingsWindow.is_backend_switch_in_progress()` is true, since `release_all()` would otherwise race
+the worker thread's own still-in-flight release/reopen of the same camera handles.
+reopens under the *same* backend a handle already used and has never shown this failure mode.
+
+**`capture.read()` can raise, not just fail — `_safe_read` wraps every call site in this module.**
+The retry/revert logic above initially still weren't enough: the real failure turned out to be
+OpenCV itself raising `cv2.error: ... (-215:Assertion failed) _step >= minstep in function
+'cv::Mat::Mat'` *out of* `capture.read()` when Media Foundation returned a malformed/inconsistent
+frame buffer for a specific requested resolution — an uncaught Python exception, not a `(False,
+None)` result. Every call site in this module (including `_CameraReaderThread`'s own background
+read loop) treated `capture.read()`'s result as a plain tuple to test, never as something that
+could raise; left unguarded, that exception unwound mid-operation and skipped every step after the
+failing read — including the code that would install the new capture handle or resume the reader
+thread — which is exactly what turned one bad frame into a camera stuck fully offline until the
+whole app was restarted (worse for the reader thread specifically: an uncaught exception there
+silently kills the thread outright, since Python threads don't propagate exceptions to the main
+thread). `_safe_read(capture)` now wraps every `capture.read()` call in this module and catches
+`cv2.error`, returning `(False, None)` like an ordinary failed read instead — the pre-existing
+per-resolution/per-backend fallback logic above then handles it exactly like any other failed
+candidate, no special-casing needed once the exception itself can no longer escape. Logs the
+caught error's message only (no traceback) since this can legitimately repeat many times in a row
+during one probe/retry sequence, all with the identical underlying message.
+
+**Framerate is now explicitly requested too** (`_TARGET_FPS`, applied in `_apply_resolution`
+alongside width/height) — UVC negotiates FourCC/resolution/framerate together as one bundled mode,
+and this app previously never requested a framerate at all, leaving the driver/backend to default to
+whichever one it happened to pick for a given resolution+format (commonly a low one at larger
+resolutions). Diagnosed from an operator report of a camera confirmed to deliver smooth 1080p30 in
+other applications while measuring far below that here — pointing at a negotiation gap in this app's
+own request rather than a hardware/bandwidth ceiling (already addressed separately by preferring a
+compressed resolution, see `_best_candidate_preferring_compression` above). A camera/driver that
+doesn't support 30fps at a given resolution simply clamps to what it does support, same
+accepted-limitation pattern as every other capability probed this way.
+
+### Precise native-format enumeration via pygrabber (`capture/dshow_native_formats.py`)
+
+`cv2.VideoCapture` only exposes a generic, best-effort property API for resolution/FourCC/FPS --
+it has no way to ask a camera what it *actually* natively supports the way a native application
+does, so every negotiation this app does is really a guess (a candidate size/format is requested,
+then whatever the driver actually landed on is read back). Diagnosed against a real operator report
+-- and confirmed directly against their own attached camera (a Logitech StreamCam) using this
+module: it natively advertises MJPG at every tested resolution up to and including 1920x1080,
+proving the "only uncompressed/only 640x480 available" behavior seen through cv2 was a negotiation
+precision gap in this app's own request, not a hardware limitation.
+
+`list_native_formats(device_index)` queries DirectShow's own `IAMStreamConfig::GetStreamCaps`
+(via the `pygrabber` package) for a camera's exact advertised (compression, resolution) modes --
+authoritative ground truth, surfaced in the Settings Cameras tab's diagnostics export alongside
+(not replacing) the existing cv2-probed list, specifically so an operator/developer never has to
+guess again.
+
+This module previously also went a step further with `try_apply_best_native_format`, which
+selected and applied one of those exact native modes directly via `IAMStreamConfig::SetFormat`,
+called from `_open_camera` immediately *before* cv2 ever opened the same device index, on the
+theory that a UVC driver might persist that as the device's current mode across the handoff.
+**Confirmed against the operator's own real `app.log` to be actively harmful, and removed**:
+opening a second DirectShow graph to pre-set the format left the device in a state that made cv2's
+own subsequent open crash repeatedly (`cv2.error: ... _step >= minstep in function
+'cv::Mat::Mat'`) at the requested resolution, which `_open_camera`'s existing self-heal logic then
+(correctly, but unnecessarily) read as "camera did not honor requested resolution" and fell back
+to a resolution *lower* than before this nudge existed (observed: a requested 1920x1080 falling
+all the way back to 640x480). The actual root cause of the uncompressed-fallback problem turned
+out to be simpler and is fixed directly in `capture/camera_manager.py::_apply_resolution`: setting
+`CAP_PROP_FRAME_WIDTH`/`HEIGHT` on this camera's DirectShow driver was silently resetting the
+filter graph's format node back to its uncompressed default, undoing the `CAP_PROP_FOURCC` MJPG
+request `_open_camera` makes at open time -- `_apply_resolution` now re-asserts
+`CAP_PROP_FOURCC` to MJPG *after* width/height are set, on every resolution application (auto and
+operator-chosen exact alike), which is when the actual final negotiation happens.
 
 ### `validation_status` semantics (decided in `document/field_crosscheck.py`)
 
@@ -170,7 +409,10 @@ before a given key existed will lack it.
 - `ui/settings_window.py` — data storage locations (via `config/app_paths.py`), manual purge,
   camera-to-side assignment, capture keyboard shortcut, the live prerequisites checklist, and
   triggering a backup (`storage/backup.py`, a single zip of the DB + all images for an operator
-  to copy off-machine — supplements BitLocker, doesn't replace it).
+  to copy off-machine — supplements BitLocker, doesn't replace it). Its own window size/position
+  persists across restarts (`_restore_window_geometry`/`_save_window_geometry`, under the
+  `settings_window_geometry` setting key), mirroring `ui/main_window.py`'s identical mechanism for
+  its own window (`window_geometry`) — the two are independent settings, one per window.
 - `ui/calibration_window.py` — captures a series of known-good same-person face-match score
   samples on the operator's own hardware/lighting and suggests a threshold from that
   distribution; scores are kept in memory only for the session and never written to the `scans`
@@ -235,3 +477,15 @@ explicitly opts into placing alongside the app, so resolving them relative to `s
   neutral grey tile — this is cosmetic only, independent of which countries' documents the OCR/
   MRZ/AAMVA/EU-driving-licence pipelines actually support (see `config/ocr_languages.py` for the
   OCR language set and `document/doc_classifier.py` for supported document types).
+- `document/eu_id_card_parser.py` (the non-Swedish EU/EEA national-ID-card fallback, anchored on
+  EU Regulation 2019/1157's mandatory English field labels) is a heuristic best-effort parser with
+  no real non-Swedish national ID card OCR sample available to validate its same-line/next-line
+  label-to-value heuristic against — same caveat as `dl_field_parser.py`/`barcode_parser.py`. A
+  parse failure degrades gracefully to '-' placeholders, same as any other document with no
+  structured fields.
+- Manual camera exposure/brightness control (`ui/settings_window.py`'s Cameras tab,
+  `capture/camera_manager.py::ExposureSettings`) depends on the camera/driver actually honoring
+  `cv2.CAP_PROP_AUTO_EXPOSURE`/`CAP_PROP_EXPOSURE`/`CAP_PROP_BRIGHTNESS` over DirectShow, which
+  varies by device — a camera that ignores these simply keeps behaving as it did before, same
+  accepted-limitation pattern as `set_exact_resolution`'s own resolution fallback. The slider
+  ranges are reasonable starting points, not calibrated per-device.

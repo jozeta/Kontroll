@@ -5,6 +5,7 @@ import json
 import logging
 import shutil
 import sqlite3
+import time
 import traceback
 from dataclasses import asdict, dataclass
 from datetime import date, datetime
@@ -14,15 +15,12 @@ from typing import Callable
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
-from PyQt6.QtCore import QByteArray, QDate, QObject, QPoint, QRect, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QByteArray, QDate, QObject, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QCloseEvent,
     QColor,
-    QImage,
     QKeySequence,
     QMouseEvent,
-    QPainter,
-    QPen,
     QPixmap,
     QResizeEvent,
     QShortcut,
@@ -54,7 +52,6 @@ from PyQt6.QtWidgets import (
 )
 
 from capture.camera_manager import CameraManager
-from capture.frame_capture import capture_still_frame
 from config.app_paths import get_documents_dir, get_faces_dir, get_flagged_images_dir
 from config.settings import (
     get_barcode_overlap_threshold,
@@ -64,19 +61,16 @@ from config.settings import (
     get_setting_or_none,
     set_setting,
 )
-from document.aamva_parser import parse_first_aamva_barcode
-from document.barcode_parser import decode_pdf417_barcodes
-from document.card_detector import detect_and_crop_card
 from document.country_flags import alpha2_for_country_code
 from document.dates import calculate_age, parse_mrz_style_date
-from document.dl_field_parser import parse_driving_licence_fields
-from document.doc_classifier import DocumentClassification, classify_document
+from document.doc_classifier import DocumentClassification
 from document.field_crosscheck import (
     CrosscheckResult,
     PersonFlagsResult,
     check_person_flags,
     determine_validation_status,
 )
+from document.field_extraction import extract_document_fields
 from document.flag_matcher import FlagMatch, find_matching_flagged_person
 from document.image_quality import (
     ImageQualityResult,
@@ -84,11 +78,6 @@ from document.image_quality import (
     is_frame_too_blurry,
     is_resolution_too_low_for_ocr,
 )
-from document.mrz_locator import locate_mrz_band
-from document.mrz_parser import parse_and_validate_mrz
-from document.national_id_parser import parse_national_id_fields
-from document.ocr import correct_text_orientation, extract_mrz_candidate_text, extract_words_and_text
-from document.passport_parser import parse_passport_fields
 from face.detector import detect_faces
 from face.embedder import get_best_face_embedding
 from face.matcher import MatchResult, match_faces
@@ -115,6 +104,7 @@ from storage.models import (
 )
 from ui.flag_icons import render_flag_icon
 from ui.flag_retroactive import run_retroactive_flag_check
+from ui.frame_display import bgr_frame_to_pixmap as _bgr_frame_to_pixmap, shrink_to_fit as _shrink_to_fit
 from ui.image_viewer import ClickableThumbnailLabel
 from ui.scan_export import build_batch_report_html, build_scan_report_html
 from ui.settings_window import SettingsWindow
@@ -146,15 +136,6 @@ _SIGNAL_LOST_TICK_THRESHOLD = round(1000 / _PREVIEW_INTERVAL_MS)
 
 _OVERRIDE_CHOICES = ["Automatic", "Override: Match", "Override: No Match"]
 
-# Color the crop-selection rectangle is drawn in over the frozen document preview (see
-# DocumentCropLabel) -- bright yellow so it reads clearly against a document photo of any color.
-_CROP_RECT_COLOR = QColor("#FFEB3B")
-
-# Minimum crop-rectangle side length, in on-screen label pixels, for a drag to count as a real
-# crop selection rather than an accidental single click/tiny jitter -- below this,
-# MainWindow._crop_rect_to_frame_bounds treats it as no selection and the full frame is used.
-_MIN_CROP_DRAG_PX = 20
-
 # Opacity applied to the date-filter dropdown while "Any date" is checked -- dims it to signal
 # it's inactive without actually disabling it, since a disabled widget can't receive the click
 # that opens its calendar popup (see MainWindow._on_date_calendar_shown).
@@ -185,35 +166,6 @@ _TOP_PANE_HEIGHT_SETTING_KEY = "top_pane_height"
 def _format_timestamp(created_at: str) -> str:
     """Format a scan's stored ISO-format created_at timestamp as 'YYYY-MM-DD HH:MM:SS' for display."""
     return datetime.fromisoformat(created_at).strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _shrink_to_fit(frame: np.ndarray, target_width: int, target_height: int) -> np.ndarray:
-    """Downscale a BGR frame (via cheap cv2.resize) to approximately fit within target_width x target_height, preserving aspect ratio -- a no-op if it's already smaller either way.
-
-    Meant to run *before* _bgr_frame_to_pixmap's color-space conversion and QImage copy, both of
-    which cost proportional to pixel count -- calling it first means those don't pay full-camera-
-    resolution (or full-saved-image-resolution) cost on every live-preview tick or thumbnail load
-    just to have most of that detail immediately discarded by a later scale-down to a small label.
-    The final Qt-side .scaled() callers already do for exact-size fitting stays in place regardless
-    (cheap once the image is already this much smaller) so this doesn't change what's displayed.
-    """
-    height, width = frame.shape[:2]
-    if target_width <= 0 or target_height <= 0 or (width <= target_width and height <= target_height):
-        return frame
-    scale = min(target_width / width, target_height / height)
-    new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
-    return cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA)
-
-
-def _bgr_frame_to_pixmap(frame: np.ndarray) -> QPixmap:
-    """Convert an OpenCV BGR frame into a QPixmap suitable for display in a QLabel."""
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    height, width, channels = rgb_frame.shape
-    bytes_per_line = channels * width
-    # .copy() detaches the QImage from rgb_frame's buffer, which is a stack-local that would
-    # otherwise be freed once this function returns.
-    qimage = QImage(rgb_frame.data, width, height, bytes_per_line, QImage.Format.Format_RGB888).copy()
-    return QPixmap.fromImage(qimage)
 
 
 def _load_thumbnail(image_path: str | None) -> QPixmap | None:
@@ -355,34 +307,34 @@ def _analyze_capture(
     sqlite3 connections aren't safe to share across threads, but these three are cheap
     single-table reads the caller does up front on the main thread instead.
     """
-    # The document camera frames the whole light-box/desk area, so the card itself typically
-    # occupies only a modest fraction of even a high-resolution capture -- too low an effective
-    # pixel density for OCR to read reliably. detect_and_crop_card finds and crops+upscales to the
-    # card's own bounding box before any OCR/MRZ/barcode work (falling back to the original frame
-    # untouched if no confident match is found), while face detection uses the original,
-    # uncropped doc_frame -- see document/card_detector.py.
-    doc_analysis_frame = detect_and_crop_card(doc_frame)
-    # card_detector.py's crop only guarantees a landscape shape, not which way up it reads --
-    # correct_text_orientation salvages the (otherwise-total) OCR failure that follows when its
-    # fixed-direction rotation happens to leave the text sideways. Applied before every downstream
-    # use of doc_analysis_frame (OCR, MRZ band location, barcode decode all follow below), not just
-    # this function's own OCR pass, since all of them assume an upright frame.
-    doc_analysis_frame = correct_text_orientation(doc_analysis_frame)
+    # Stage timings logged at the end of this function (see the final logger.info call below) --
+    # this pipeline runs on a background thread already (see _CaptureAnalysisWorker), so it never
+    # blocks the UI, but a slow stage on weaker production hardware is otherwise invisible; this is
+    # what turns "capture feels slow" into a concrete per-stage millisecond breakdown in app.log.
+    _pipeline_started_at = time.monotonic()
 
-    # extract_words_and_text runs OCR twice against this same preprocessed image (via
-    # pytesseract.image_to_data and image_to_string) -- kept as two separate Tesseract calls rather
-    # than reconstructing one from the other's output, since image_to_data's per-word layout
-    # doesn't reliably reproduce image_to_string's spacing, which mrz_parser/dl_field_parser depend
-    # on, but sharing one preprocessing pass between them rather than each redoing it independently.
+    # Crop-to-card, OCR, MRZ/barcode location+validation, document classification, and structured
+    # field extraction -- see document/field_extraction.py for the detailed per-step rationale
+    # (extracted there, out of this function's original home, so ui/image_viewer.py::
+    # ImageEditDialog's "what would this image extract to" preview can run the exact same logic
+    # rather than risk drifting out of sync with it).
+    document_fields_result = extract_document_fields(doc_frame)
+    doc_analysis_frame = document_fields_result.doc_analysis_frame
+    ocr_words = document_fields_result.ocr_words
+    ocr_text = document_fields_result.ocr_text
+    mrz_result = document_fields_result.mrz_result
+    barcode_texts = document_fields_result.barcode_texts
+    doc_classification = document_fields_result.doc_classification
+    doc_fields = document_fields_result.doc_fields
+    _document_extraction_elapsed = time.monotonic() - _pipeline_started_at
+
     # ocr_words' per-word confidence feeds assess_image_quality's hard-to-read-text check below;
-    # ocr_text isn't needed until the MRZ parsing further down, but there's no reason to preprocess
-    # doc_analysis_frame a second time just to defer computing it until then.
-    ocr_words, ocr_text = extract_words_and_text(doc_analysis_frame)
     # Blur/glare/resolution are still measured against the original doc_frame (a diagnostic about
     # the raw camera capture itself, e.g. "camera silently defaulted to a low resolution mode") --
     # only the OCR-confidence-based legibility check benefits from using the cropped, higher-
     # effective-density frame the field parsers actually run on.
     doc_image_quality = assess_image_quality(doc_frame, ocr_words)
+    _quality_elapsed = time.monotonic() - _pipeline_started_at - _document_extraction_elapsed
     if doc_image_quality.has_warning:
         logger.info(
             "Document capture flagged low quality (%s): blur_score=%.1f glare_ratio=%.2f "
@@ -401,70 +353,9 @@ def _analyze_capture(
     match_result = None
     if live_embedding is not None and doc_embedding is not None:
         match_result = match_faces(live_embedding, doc_embedding, face_match_threshold)
+    _face_elapsed = time.monotonic() - _pipeline_started_at - _document_extraction_elapsed - _quality_elapsed
 
-    mrz_result = parse_and_validate_mrz(ocr_text)
-    if not mrz_result.found:
-        # General-purpose OCR's two fixed-width MRZ lines can get lost entirely amid surrounding
-        # printed text/security-pattern noise (diagnosed against a real passport capture where
-        # this happened) -- a second, MRZ-alphabet-whitelisted OCR pass recovers it far more
-        # reliably. Only tried once the cheaper general-purpose attempt has already failed, since
-        # the extra Tesseract call costs ~1s and would actively hurt name-field text (which needs
-        # the full alphabet, not just MRZ's). locate_mrz_band crops tightly to the MRZ itself
-        # first when it can find one (a bound passport photographs as its whole open book, not
-        # just the bio-data page -- see document/mrz_locator.py), falling back to the full frame
-        # unchanged otherwise, so this is a safe no-op improvement for every other document type.
-        mrz_band = locate_mrz_band(doc_analysis_frame)
-        mrz_candidate_text = extract_mrz_candidate_text(mrz_band)
-        mrz_result = parse_and_validate_mrz(mrz_candidate_text)
-    barcode_texts = decode_pdf417_barcodes(doc_analysis_frame)
-    doc_classification = classify_document(mrz_result, barcode_texts, ocr_text)
     crosscheck_result = determine_validation_status(mrz_result, barcode_texts, ocr_text, barcode_overlap_threshold)
-
-    if mrz_result.found:
-        doc_fields = mrz_result.fields
-        if doc_classification.doc_type == "passport" and not (doc_fields.get("surname") and doc_fields.get("name")):
-            # The MRZ's line 2 alone (see mrz_parser.py's TD3-line-2-only recovery) carries every
-            # checksummed data field but never a name -- ICAO 9303 puts no check digit on line 1
-            # (name) at all, so a corrupted line 1 is recovered from here by falling back to
-            # passport_parser.py's independent, OCR-label-anchored name search instead, without
-            # touching the MRZ-derived (and more trustworthy) dates/document number/personal
-            # number already in doc_fields.
-            passport_fields = parse_passport_fields(ocr_text).fields
-            doc_fields = {**doc_fields, **{key: passport_fields[key] for key in ("surname", "name") if passport_fields.get(key)}}
-    elif doc_classification.classified_from == "aamva_barcode":
-        # A US/Canadian driver's licence or ID card's fields come from its AAMVA barcode payload,
-        # not OCR -- see document/aamva_parser.py. Checked ahead of the doc_type branches below
-        # since AAMVA can classify as either "drivers_licence" or "national_id" (see
-        # document/doc_classifier.py::_classify_from_aamva_barcode) and both need this same
-        # barcode-sourced extraction, not the OCR-heuristic one those branches otherwise use for
-        # EU/Swedish documents.
-        doc_fields = parse_first_aamva_barcode(barcode_texts).fields
-    elif doc_classification.doc_type == "drivers_licence":
-        # Driving licences carry no MRZ, so name/birth-date have to come from a heuristic OCR read
-        # of the licence's EU-harmonized numbered fields instead (see dl_field_parser.py). Gated
-        # on doc_classification rather than just "no MRZ found" -- a passport or national ID card
-        # whose MRZ failed to read is still not a driving licence, and running dl_field_parser's
-        # field-number-anchored regexes against arbitrary OCR noise from an unrelated document
-        # layout risks extracting a spurious fake name (diagnosed against a real passport capture
-        # where this produced exactly that).
-        dl_fields_result = parse_driving_licence_fields(ocr_text)
-        doc_fields = dl_fields_result.fields if dl_fields_result.found else {}
-    elif doc_classification.doc_type == "national_id":
-        # A Swedish national ID card's MRZ is printed on the back -- a front-only capture (the
-        # common case at a desk) never has one to read, so name/personnummer/dates come from an
-        # OCR-only heuristic read instead, same idea as the driving licence path above (see
-        # document/national_id_parser.py).
-        national_id_result = parse_national_id_fields(ocr_text)
-        doc_fields = national_id_result.fields if national_id_result.found else {}
-    elif doc_classification.doc_type == "passport":
-        # The MRZ is always preferred for a passport (see the extract_mrz_candidate_text fallback
-        # above) -- this only runs once that has already failed, e.g. a heavily noisy capture. See
-        # document/passport_parser.py for why this needs its own parser rather than reusing
-        # dl_field_parser/national_id_parser.
-        passport_result = parse_passport_fields(ocr_text)
-        doc_fields = passport_result.fields if passport_result.found else {}
-    else:
-        doc_fields = {}
     doc_fields_json = json.dumps(doc_fields)
 
     person_flags = check_person_flags(doc_fields)
@@ -501,6 +392,17 @@ def _analyze_capture(
                 else None
             ),
         }
+    )
+
+    _total_elapsed = time.monotonic() - _pipeline_started_at
+    logger.info(
+        "Capture analysis pipeline took %.2fs total (document-extraction=%.2fs quality=%.2fs face=%.2fs "
+        "crosscheck/flags=%.2fs)",
+        _total_elapsed,
+        _document_extraction_elapsed,
+        _quality_elapsed,
+        _face_elapsed,
+        _total_elapsed - _document_extraction_elapsed - _quality_elapsed - _face_elapsed,
     )
 
     return CaptureAnalysis(
@@ -685,6 +587,7 @@ class HistoryRowWidget(QFrame):
         self,
         conn: sqlite3.Connection,
         scan: ScanRecord,
+        face_analysis_app: FaceAnalysis | None = None,
         on_delete: Callable[["HistoryRowWidget", int], None] | None = None,
         on_flagged_persons_changed: Callable[[], None] | None = None,
         on_jump_to_scan: Callable[[int], None] | None = None,
@@ -697,6 +600,12 @@ class HistoryRowWidget(QFrame):
         super().__init__(parent)
         self.conn = conn
         self.scan = scan
+        # Passed through to each thumbnail's ClickableThumbnailLabel (see _build_thumbnail) so
+        # double-clicking the face thumbnail can auto-zoom to the detected face -- see
+        # ui/image_viewer.py. None is a valid, supported value (e.g. _SAMPLE_SCAN_FOR_SIZING's
+        # throwaway sizing row never gets double-clicked), and just disables that thumbnail's
+        # auto-zoom rather than erroring.
+        self.face_analysis_app = face_analysis_app
         self._on_delete = on_delete
         self._on_flagged_persons_changed = on_flagged_persons_changed
         self._on_jump_to_scan = on_jump_to_scan
@@ -758,7 +667,7 @@ class HistoryRowWidget(QFrame):
         self.export_selection_checkbox.toggled.connect(self._on_export_selection_toggled)
         summary_row.addWidget(self.export_selection_checkbox)
 
-        summary_row.addWidget(self._build_thumbnail(self.scan.face_image_path, "Live Face Capture"))
+        summary_row.addWidget(self._build_thumbnail(self.scan.face_image_path, "Live Face Capture", kind="face"))
         summary_row.addWidget(self._build_doc_thumbnail_column())
 
         display_fields = self.display_fields
@@ -849,7 +758,7 @@ class HistoryRowWidget(QFrame):
         container = QWidget()
         container.setFixedSize(*_THUMBNAIL_SIZE)
 
-        thumbnail = self._build_thumbnail(self.scan.doc_image_path, "Document Capture")
+        thumbnail = self._build_thumbnail(self.scan.doc_image_path, "Document Capture", kind="document")
         thumbnail.setParent(container)
         thumbnail.move(0, 0)
 
@@ -914,9 +823,16 @@ class HistoryRowWidget(QFrame):
             return None
         return f"Low quality ({quality.get('text', 'unknown')})"
 
-    def _build_thumbnail(self, image_path: str | None, title: str) -> QLabel:
-        """Build a fixed-size thumbnail label for one of the row's two saved images. Double-clicking it opens the full image in a resizable viewer window."""
-        label = ClickableThumbnailLabel(image_path, title)
+    def _build_thumbnail(self, image_path: str | None, title: str, kind: str | None = None) -> QLabel:
+        """Build a fixed-size thumbnail label for one of the row's two saved images. Double-clicking it opens the full image in a resizable viewer window, auto-zoomed to the detected face/card region when kind is given, with an "Edit image…" (crop/brightness/contrast, then optional re-analyze) action -- see ui/image_viewer.py."""
+        label = ClickableThumbnailLabel(
+            image_path,
+            title,
+            kind=kind,
+            face_analysis_app=self.face_analysis_app,
+            scan=self.scan,
+            on_reanalyze=self._on_reanalyze,
+        )
         label.setFixedSize(*_THUMBNAIL_SIZE)
         pixmap = _load_thumbnail(image_path)
         if pixmap is not None:
@@ -1373,63 +1289,44 @@ class _ClickAnywhereDateEdit(QDateEdit):
         popup.show()
 
 
-class DocumentCropLabel(QLabel):
-    """The document preview label, extended to let the operator drag out a crop rectangle over a frozen captured frame.
+class _QualityOverlayLabel(QLabel):
+    """The document preview label, extended only to host the live blur/resolution quality-warning banner (see set_quality_overlay) -- kept as its own QLabel subclass (rather than a plain QLabel) purely so that banner can be positioned with explicit geometry inside the label's own frame rather than displacing it in the surrounding layout.
 
-    Only interactive while crop_mode_enabled is True (toggled by MainWindow when it's showing a
-    just-captured document frame for review) -- during normal live preview, mouse events pass
-    straight through to the base QLabel untouched, so this has no effect on ordinary preview
-    behavior. The rectangle is tracked and painted in *label* pixel coordinates (what the operator
-    visually sees, drag handles included) rather than the underlying frame's own resolution;
-    MainWindow._crop_rect_to_frame_bounds is what converts it back to frame coordinates against
-    the currently displayed pixmap's scale and centering offset before the numpy frame is actually
-    sliced.
+    No longer adds crop-selection support -- capture now saves immediately with no operator review/
+    crop step (see MainWindow._run_capture_and_process); cropping moved to a post-hoc "Edit image…"
+    action on a saved thumbnail (see ui/image_viewer.py).
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        self.crop_mode_enabled = False
-        self.crop_rect: QRect | None = None
-        self._drag_origin: QPoint | None = None
+        self._quality_overlay: QLabel | None = None
 
-    def reset_crop(self) -> None:
-        self.crop_rect = None
-        self._drag_origin = None
-        self.update()
+    def set_quality_overlay(self, overlay: QLabel) -> None:
+        """Parent a warning banner directly onto this label so it paints on top of the live preview instead of occupying its own row above it.
 
-    def mousePressEvent(self, event: QMouseEvent) -> None:
-        if self.crop_mode_enabled and event.button() == Qt.MouseButton.LeftButton:
-            self._drag_origin = event.position().toPoint()
-            self.crop_rect = QRect(self._drag_origin, self._drag_origin)
-            self.update()
+        Positioned with explicit geometry inside this label's own frame (see _position_quality_
+        overlay), so toggling it visible/hidden never changes this label's size -- previously, a
+        separate layout row above the preview label pushed the boxed preview down by exactly the
+        banner's height whenever it appeared, misaligning this preview's top border against the
+        sibling preview's border (which never has a banner).
+        """
+        overlay.setParent(self)
+        self._quality_overlay = overlay
+        self._position_quality_overlay()
+
+    def _position_quality_overlay(self) -> None:
+        if self._quality_overlay is None:
             return
-        super().mousePressEvent(event)
+        inset = self.frameWidth()
+        overlay_width = max(self.width() - 2 * inset, 0)
+        self._quality_overlay.setFixedWidth(overlay_width)
+        self._quality_overlay.adjustSize()
+        self._quality_overlay.move(inset, inset)
+        self._quality_overlay.raise_()
 
-    def mouseMoveEvent(self, event: QMouseEvent) -> None:
-        if self.crop_mode_enabled and self._drag_origin is not None:
-            self.crop_rect = QRect(self._drag_origin, event.position().toPoint()).normalized()
-            self.update()
-            return
-        super().mouseMoveEvent(event)
-
-    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
-        if self.crop_mode_enabled and self._drag_origin is not None:
-            self.crop_rect = QRect(self._drag_origin, event.position().toPoint()).normalized()
-            self._drag_origin = None
-            self.update()
-            return
-        super().mouseReleaseEvent(event)
-
-    def paintEvent(self, event) -> None:
-        super().paintEvent(event)
-        if self.crop_rect is None or self.crop_rect.isNull():
-            return
-        painter = QPainter(self)
-        pen = QPen(_CROP_RECT_COLOR)
-        pen.setWidth(2)
-        painter.setPen(pen)
-        painter.drawRect(self.crop_rect)
-        painter.end()
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_quality_overlay()
 
 
 class MainWindow(QMainWindow):
@@ -1459,14 +1356,6 @@ class MainWindow(QMainWindow):
         # _on_capture_and_process_clicked and _on_discard_pending_capture_clicked.
         self._pending_face_frame: np.ndarray | None = None
         self._pending_doc_frame: np.ndarray | None = None
-        # Set once both frames of a capture are successfully in hand, holding them frozen for
-        # operator review (optionally cropping the document image) before the face-match/OCR
-        # pipeline actually runs -- see _enter_document_review / _exit_document_review. Distinct
-        # from _pending_face_frame/_pending_doc_frame above, which hold a *partial* capture (one
-        # camera failed) awaiting a retry, not a full pair awaiting operator review.
-        self._review_face_frame: np.ndarray | None = None
-        self._review_doc_frame: np.ndarray | None = None
-        self._in_document_review = False
         # Consecutive failed preview-tick reads per camera, since the last successful one -- once
         # either crosses _SIGNAL_LOST_TICK_THRESHOLD, _update_previews swaps that camera's frozen
         # last-good frame for an explicit "signal lost" message rather than leaving it looking
@@ -1474,6 +1363,8 @@ class MainWindow(QMainWindow):
         # sustained run of them does, so an occasional one-off missed frame doesn't flicker it.
         self._face_signal_lost_streak = 0
         self._doc_signal_lost_streak = 0
+        # See _warn_if_preview_tick_slow -- throttles how often a slow preview tick gets logged.
+        self._slow_preview_tick_streak = 0
         # Backing state for the live document-camera blur warning (see
         # _update_doc_quality_warning) -- the tick count drives the throttled check interval, and
         # the last result is kept between checks so the banner doesn't flicker off on the ticks a
@@ -1483,8 +1374,8 @@ class MainWindow(QMainWindow):
         # Guards against re-entrant capture runs. The actual analysis pipeline runs on a background
         # thread now (see _start_capture_analysis), not synchronously -- without this, a click (or
         # shortcut press) during that window would fire a second, overlapping capture, and worse,
-        # a second Re-analyze/Save could end up calling into the shared face_analysis_app model
-        # from two worker threads at once. Set by both _on_save_capture_clicked and
+        # a second Re-analyze/capture could end up calling into the shared face_analysis_app model
+        # from two worker threads at once. Set by both _on_capture_and_process_clicked and
         # _on_reanalyze_scan_requested, the two callers of _start_capture_analysis.
         self._is_processing = False
         # Set just before _start_capture_analysis is called and read back once its background
@@ -1492,8 +1383,9 @@ class MainWindow(QMainWindow):
         # running QThread/worker otherwise (see _start_capture_analysis's own docstring).
         self._capture_analysis_thread: QThread | None = None
         self._capture_analysis_worker: _CaptureAnalysisWorker | None = None
-        # The capture button's own text, saved by _on_save_capture_clicked just before it's
-        # overwritten with "Processing…", so _end_capture_processing can restore it afterward.
+        # The capture button's own text, saved by _on_capture_and_process_clicked just before it's
+        # overwritten with "Capturing…"/"Processing…", so _end_capture_processing can restore it
+        # afterward.
         self._capture_button_original_text = ""
         # Scan ids checked via each row's export-selection checkbox, for the "Export selected"
         # batch-export button in the filter row -- see _on_history_row_selection_toggled /
@@ -1541,13 +1433,11 @@ class MainWindow(QMainWindow):
 
         previews_row = QHBoxLayout()
         self.face_preview_label = self._build_preview_label()
-        self.doc_preview_label = self._build_preview_label(DocumentCropLabel)
+        self.doc_preview_label = self._build_preview_label(_QualityOverlayLabel)
         self.doc_quality_warning_label = self._build_quality_warning_label()
+        self.doc_preview_label.set_quality_overlay(self.doc_quality_warning_label)
         previews_row.addLayout(self._build_preview_column("Visitor", self.face_preview_label), stretch=1)
-        previews_row.addLayout(
-            self._build_preview_column("Identification", self.doc_preview_label, self.doc_quality_warning_label),
-            stretch=1,
-        )
+        previews_row.addLayout(self._build_preview_column("Identification", self.doc_preview_label), stretch=1)
         top_layout.addLayout(previews_row, stretch=1)
 
         capture_row = QHBoxLayout()
@@ -1563,7 +1453,6 @@ class MainWindow(QMainWindow):
         capture_row.addWidget(self.discard_pending_button)
 
         top_layout.addLayout(capture_row)
-        top_layout.addWidget(self._build_review_controls_row())
 
         bottom_widget = QWidget()
         bottom_layout = QVBoxLayout(bottom_widget)
@@ -1671,10 +1560,18 @@ class MainWindow(QMainWindow):
         self._settings_window.activateWindow()
 
     def _pause_camera_previews(self) -> None:
-        """Stop the live-preview poll -- see SettingsWindow's on_camera_probe_started docstring for why this is handed to it as a callback rather than it reaching into preview_timer directly."""
+        """Stop the live-preview poll and both cameras' background reader threads -- see SettingsWindow's on_camera_probe_started docstring for why this is handed to it as a callback rather than it reaching into preview_timer/camera_manager directly.
+
+        Pausing camera_manager's reader threads (see capture.camera_manager._CameraReaderThread)
+        matters now, not just the QTimer: Settings' resolution probing/diagnostics export/exposure
+        changes access face_capture/doc_capture directly, which would otherwise race against those
+        background threads' own concurrent capture.read() calls on the same handle.
+        """
         self.preview_timer.stop()
+        self.camera_manager.pause_readers()
 
     def _resume_camera_previews(self) -> None:
+        self.camera_manager.resume_readers()
         self.preview_timer.start(_PREVIEW_INTERVAL_MS)
 
     def _on_settings_data_changed(self) -> None:
@@ -1834,8 +1731,8 @@ class MainWindow(QMainWindow):
         A minimum size (rather than a fixed one) keeps it from collapsing to nothing when the
         splitter handle above is dragged small, while still letting it grow -- _update_previews
         rescales each incoming frame to the label's current size on every tick. label_class lets
-        the document preview use DocumentCropLabel (adding crop-selection support) while the face
-        preview stays a plain QLabel, without duplicating this setup.
+        the document preview use _QualityOverlayLabel (adding the live quality-warning banner) while
+        the face preview stays a plain QLabel, without duplicating this setup.
         """
         label = label_class("No camera signal")
         label.setMinimumSize(*_PREVIEW_SIZE)
@@ -1844,49 +1741,8 @@ class MainWindow(QMainWindow):
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return label
 
-    def _build_review_controls_row(self) -> QWidget:
-        """Build the row of buttons shown only while a just-captured frame pair is frozen for operator review (see _enter_document_review), hidden the rest of the time.
-
-        Save/Discard mirror the two outcomes described in the feature request this implements: the
-        operator can accept the capture as-is, optionally after drawing a crop box on the document
-        image to trim it down to just the card/passport itself (discarding background/glare
-        outside that box), or discard the whole pair and retake. Crop mode only affects the
-        document preview (DocumentCropLabel) -- the face capture is never manually cropped, since
-        detector.py already finds and isolates the face itself for matching.
-        """
-        row = QHBoxLayout()
-
-        self.crop_toggle_button = QPushButton("Draw crop box")
-        self.crop_toggle_button.setCheckable(True)
-        self.crop_toggle_button.setMinimumHeight(40)
-        self.crop_toggle_button.toggled.connect(self._on_toggle_crop_mode_clicked)
-        row.addWidget(self.crop_toggle_button)
-
-        self.clear_crop_button = QPushButton("Clear crop")
-        self.clear_crop_button.setMinimumHeight(40)
-        self.clear_crop_button.clicked.connect(self._on_clear_crop_clicked)
-        row.addWidget(self.clear_crop_button)
-
-        self.save_capture_button = QPushButton("Save ✓")
-        self.save_capture_button.setMinimumHeight(40)
-        self.save_capture_button.setStyleSheet("font-weight: bold;")
-        self.save_capture_button.clicked.connect(self._on_save_capture_clicked)
-        row.addWidget(self.save_capture_button, stretch=1)
-
-        self.discard_capture_button = QPushButton("Discard ✗")
-        self.discard_capture_button.setMinimumHeight(40)
-        self.discard_capture_button.clicked.connect(self._on_discard_capture_clicked)
-        row.addWidget(self.discard_capture_button)
-
-        self.review_controls_widget = QWidget()
-        self.review_controls_widget.setLayout(row)
-        self.review_controls_widget.setVisible(False)
-        return self.review_controls_widget
-
-    def _build_preview_column(
-        self, headline_text: str, preview_label: QLabel, warning_label: QLabel | None = None
-    ) -> QVBoxLayout:
-        """Stack a centered, bold, white headline (and, optionally, a warning banner -- e.g. low camera resolution) above one camera preview label."""
+    def _build_preview_column(self, headline_text: str, preview_label: QLabel) -> QVBoxLayout:
+        """Stack a centered, bold, white headline above one camera preview label."""
         column = QVBoxLayout()
 
         headline = QLabel(headline_text)
@@ -1898,18 +1754,23 @@ class MainWindow(QMainWindow):
         # this label sits directly on the window background with no fixed backdrop).
         headline.setStyleSheet("font-size: 16pt; font-weight: bold;")
         column.addWidget(headline)
-        if warning_label is not None:
-            column.addWidget(warning_label)
         column.addWidget(preview_label, stretch=1)
 
         return column
 
     def _build_quality_warning_label(self) -> QLabel:
-        """Build the (initially hidden) banner shown above the document preview when the live camera frame looks too low-resolution or too blurry for reliable OCR -- see _update_doc_quality_warning."""
+        """Build the (initially hidden) semi-transparent banner overlaid on top of the live document preview when the camera frame looks too low-resolution or too blurry for reliable OCR -- see _update_doc_quality_warning.
+
+        Attached to the preview label itself via _QualityOverlayLabel.set_quality_overlay rather
+        than placed in the surrounding layout, so it paints over the live feed instead of
+        displacing the boxed preview below it.
+        """
         label = QLabel()
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         label.setWordWrap(True)
-        label.setStyleSheet("color: #FF5252; font-weight: bold;")
+        label.setStyleSheet(
+            "color: white; background-color: rgba(211, 47, 47, 175); font-weight: bold; padding: 4px;"
+        )
         label.setVisible(False)
         return label
 
@@ -1931,17 +1792,12 @@ class MainWindow(QMainWindow):
             self._add_history_row(scan, all_scans=all_scans)
         self._apply_filters()
 
-    def _add_history_row(self, scan: ScanRecord, all_scans: list[ScanRecord] | None = None) -> None:
-        """Insert one scan as the top-most row of the history list.
-
-        all_scans, if the caller already has the full scan list in hand (e.g. _load_history
-        loading many rows at once), is forwarded to HistoryRowWidget to avoid a redundant query --
-        see its docstring. Omitted when adding a single new row (e.g. after a fresh capture),
-        where one query is just a normal one-off cost, not a hot loop.
-        """
-        row = HistoryRowWidget(
+    def _build_history_row(self, scan: ScanRecord, all_scans: list[ScanRecord] | None) -> HistoryRowWidget:
+        """Construct one HistoryRowWidget with every standard callback wired up -- shared by _add_history_row (a brand new row) and _replace_history_row (rebuilding an existing row in place), so the two can never drift apart in which callbacks they pass."""
+        return HistoryRowWidget(
             self.conn,
             scan,
+            face_analysis_app=self.face_analysis_app,
             on_delete=self._on_history_row_deleted,
             on_flagged_persons_changed=self._on_flagged_persons_changed,
             on_jump_to_scan=self._jump_to_scan,
@@ -1950,8 +1806,58 @@ class MainWindow(QMainWindow):
             on_selection_toggled=self._on_history_row_selection_toggled,
             all_scans=all_scans,
         )
+
+    def _add_history_row(self, scan: ScanRecord, all_scans: list[ScanRecord] | None = None) -> None:
+        """Insert one scan as the top-most row of the history list.
+
+        all_scans, if the caller already has the full scan list in hand (e.g. _load_history
+        loading many rows at once), is forwarded to HistoryRowWidget to avoid a redundant query --
+        see its docstring. Omitted when adding a single new row (e.g. after a fresh capture),
+        where one query is just a normal one-off cost, not a hot loop.
+        """
+        row = self._build_history_row(scan, all_scans)
         self.history_layout.insertWidget(0, row)
         self._history_rows.append(row)
+
+    def _refresh_same_person_rows(self, new_scan: ScanRecord, all_scans: list[ScanRecord]) -> None:
+        """After new_scan is added, rebuild in place every *other* already-displayed row that represents the same person, so their visit-count badge/previous-visits list picks up this new visit too.
+
+        Without this, a person's earlier row(s) keep showing whatever visit count was true at the
+        moment they were originally built -- e.g. their very first visit's row never gained a
+        "Visit 1 of N" badge at all (built with no prior visits on record, so
+        HistoryRowWidget._build_layout never added the badge in the first place -- see its
+        `if self._previous_scans_cache:` guard) even after a repeat visit made one of these,
+        because that first row is never touched again by the single-row insert _add_history_row
+        does for an ordinary capture. Deliberately targeted (only this person's rows, rebuilt in
+        place) rather than a full _reload_history() -- unlike a delete or re-analyze (which already
+        do reload everything, see _on_history_row_deleted/_finish_reanalyze), this runs on every
+        single capture, the app's most frequent action, where rebuilding the entire list each time
+        would cost far more than the handful of rows an ordinary repeat visit actually touches.
+        """
+        if not new_scan.doc_fields_json:
+            return
+        doc_fields = json.loads(new_scan.doc_fields_json)
+        if not doc_fields:
+            return
+        same_person_scans = find_previous_scans(
+            doc_fields, [row.scan for row in self._history_rows], exclude_scan_id=new_scan.id
+        )
+        if not same_person_scans:
+            return
+        same_person_ids = {scan.id for scan in same_person_scans}
+        for stale_row in [row for row in self._history_rows if row.scan.id in same_person_ids]:
+            self._replace_history_row(stale_row, all_scans)
+
+    def _replace_history_row(self, old_row: HistoryRowWidget, all_scans: list[ScanRecord]) -> None:
+        """Swap one already-displayed HistoryRowWidget for a freshly-built one at the same position in the list, e.g. to pick up a visit-count change -- see _refresh_same_person_rows."""
+        layout_index = self.history_layout.indexOf(old_row)
+        self.history_layout.removeWidget(old_row)
+        old_row.setParent(None)
+        old_row.deleteLater()
+
+        new_row = self._build_history_row(old_row.scan, all_scans)
+        self.history_layout.insertWidget(layout_index, new_row)
+        self._history_rows[self._history_rows.index(old_row)] = new_row
 
     def _on_history_row_selection_toggled(self, scan: ScanRecord, checked: bool) -> None:
         """Track/untrack one scan's id in the batch-export selection as its row checkbox is toggled, and refresh the Export selected button's count/enabled state."""
@@ -2177,14 +2083,8 @@ class MainWindow(QMainWindow):
         self._refresh_status_bar_stats()
 
     def _update_previews(self) -> None:
-        """Poll both cameras for their latest frame and refresh the live preview labels. Runs on a timer, independent of capture.
-
-        Skipped entirely while a captured frame pair is frozen for operator review (see
-        _enter_document_review) -- otherwise the next live tick would immediately overwrite the
-        very frames the operator is reviewing/cropping.
-        """
-        if self._in_document_review:
-            return
+        """Poll both cameras for their latest frame and refresh the live preview labels. Runs on a timer, independent of capture -- never frozen or paused during/after a capture, since capture now saves+processes immediately in the background with no operator review step (see _run_capture_and_process)."""
+        tick_started_at = time.monotonic()
 
         face_frame = self.camera_manager.read_face_preview_frame()
         if face_frame is not None:
@@ -2192,7 +2092,9 @@ class MainWindow(QMainWindow):
             self._set_preview_pixmap(self.face_preview_label, face_frame)
         else:
             self._face_signal_lost_streak += 1
-            self._maybe_show_signal_lost(self.face_preview_label, self._face_signal_lost_streak)
+            self._maybe_show_signal_lost(
+                self.face_preview_label, self._face_signal_lost_streak, self.camera_manager.face_capture.isOpened()
+            )
 
         doc_frame = self.camera_manager.read_doc_preview_frame()
         if doc_frame is not None:
@@ -2201,16 +2103,64 @@ class MainWindow(QMainWindow):
             self._update_doc_quality_warning(doc_frame)
         else:
             self._doc_signal_lost_streak += 1
-            self._maybe_show_signal_lost(self.doc_preview_label, self._doc_signal_lost_streak)
+            # Hide the (possibly now-stale) blur/resolution banner immediately rather than waiting
+            # for the signal-lost threshold below -- a warning about the *content* of a frame we no
+            # longer have is meaningless, and leaving the last one up produced exactly the
+            # confusing "black screen with an 'image looks blurry' message still showing over it"
+            # combination reported from a genuinely offline camera.
+            self.doc_quality_warning_label.setVisible(False)
+            self._doc_frame_looks_blurry = False
+            self._maybe_show_signal_lost(
+                self.doc_preview_label, self._doc_signal_lost_streak, self.camera_manager.doc_capture.isOpened()
+            )
 
-    def _maybe_show_signal_lost(self, label: QLabel, lost_streak: int) -> None:
-        """Once a camera has failed to return a frame for _SIGNAL_LOST_TICK_THRESHOLD consecutive ticks, replace its frozen last-good frame with an explicit warning rather than leaving it looking like a live feed."""
+        # Reuses this tick's own already-read frames rather than letting Settings do its own
+        # independent capture.read() -- see SettingsWindow.update_camera_diagnostics' docstring
+        # for why a second reader on the same handle would be unsafe. No-ops immediately unless
+        # Settings is open and its Cameras tab is the one currently showing.
+        if self._settings_window is not None:
+            self._settings_window.update_camera_diagnostics(face_frame, doc_frame)
+
+        self._warn_if_preview_tick_slow(time.monotonic() - tick_started_at)
+
+    def _warn_if_preview_tick_slow(self, elapsed_seconds: float) -> None:
+        """Log (throttled) when one full preview tick -- both camera reads plus both pixmap conversions -- takes long enough to be a user-visible stutter, since this whole method runs on the main GUI thread's timer and blocks everything else (button clicks, redraws) for its duration.
+
+        Threshold is deliberately looser than capture.camera_manager's own per-camera slow-read
+        threshold (which already logs the more specific root cause when a single camera read is
+        the culprit) -- this one is a catch-all for the tick as a whole, including cases where
+        neither individual read was slow enough alone to trip that warning but the combination
+        still added up to a noticeable stutter.
+        """
+        if elapsed_seconds <= _PREVIEW_INTERVAL_MS / 1000 * 2:
+            self._slow_preview_tick_streak = 0
+            return
+        self._slow_preview_tick_streak += 1
+        if self._slow_preview_tick_streak == 1 or self._slow_preview_tick_streak % 30 == 0:
+            logger.warning(
+                "Preview tick took %.0fms (budget ~%dms at %dfps) -- the UI may feel sluggish "
+                "during this; %d consecutive slow tick(s) so far",
+                elapsed_seconds * 1000,
+                _PREVIEW_INTERVAL_MS,
+                round(1000 / _PREVIEW_INTERVAL_MS),
+                self._slow_preview_tick_streak,
+            )
+
+    def _maybe_show_signal_lost(self, label: QLabel, lost_streak: int, camera_is_opened: bool) -> None:
+        """Once a camera has failed to return a frame for _SIGNAL_LOST_TICK_THRESHOLD consecutive ticks, replace its frozen last-good frame with an explicit warning rather than leaving it looking like a live feed.
+
+        Distinguishes a camera whose handle isn't even open (camera_is_opened=False -- genuinely
+        disconnected/powered off, or never available in the first place) from one that's open but
+        has stopped delivering frames (a transient stall CameraManager's own reconnect logic --
+        see capture.camera_manager -- is expected to recover from shortly) so the operator sees an
+        accurate "offline" instead of a "reconnecting" message that will never actually resolve.
+        """
         if lost_streak == _SIGNAL_LOST_TICK_THRESHOLD:
             label.clear()
             # CameraManager attempts its own automatic reopen shortly after this point (see
             # capture.camera_manager's reconnect logic) -- this streak resets to 0 the moment a
             # frame reads successfully again, which clears this warning with no operator action.
-            label.setText("⚠ Camera signal lost — reconnecting...")
+            label.setText("⚠ Camera offline" if not camera_is_opened else "⚠ Camera signal lost — reconnecting...")
             label.setStyleSheet("color: #FF5252; font-weight: bold; font-size: 12pt;")
 
     def _update_doc_quality_warning(self, frame: np.ndarray) -> None:
@@ -2268,43 +2218,36 @@ class MainWindow(QMainWindow):
     def _on_capture_and_process_clicked(self) -> None:
         """Entry point for the capture button/shortcut: guards against re-entrant clicks, gives the operator clear busy feedback, then delegates to _run_capture_and_process.
 
-        Grabbing the two still frames is quick, so the busy feedback here is brief -- the actual
-        slow face-match/OCR/MRZ/barcode pipeline no longer runs synchronously off this click at
-        all; it's deferred until the operator explicitly clicks Save in the review controls that
-        appear once both frames are in hand (see _enter_document_review / _on_save_capture_clicked).
-        The re-entrancy guard still matters here regardless, since a click or shortcut press queued
-        up mid-capture would otherwise fire a second, overlapping capture the instant this one
-        returns. Also declines while a previous capture is already frozen for review
-        (self._in_document_review) -- the capture button is hidden then, but the keyboard shortcut
-        stays bound to this same handler regardless of button visibility, and firing a fresh
-        capture over a held review would silently discard whatever the operator was reviewing.
+        The capture button stays disabled (progressing from "Capturing…" to "Processing…") for the
+        whole span from this click through the background analysis pipeline finishing -- see
+        _run_capture_and_process/_finish_save_capture/_end_capture_processing -- but the live
+        preview keeps running throughout (there is no freeze-for-review step, see
+        _run_capture_and_process's own docstring), so the operator can watch the next visitor
+        approach while a scan is still processing. The re-entrancy guard is what stops a click or
+        shortcut press queued up mid-capture from firing a second, overlapping capture before this
+        one's analysis has even started.
         """
-        if self._is_processing or self._in_document_review:
+        if self._is_processing:
             return
         self._is_processing = True
-        original_button_text = self.capture_button.text()
+        self._capture_button_original_text = self.capture_button.text()
         self.capture_button.setEnabled(False)
         self.capture_button.setText("Capturing…")
         QApplication.processEvents()
-        try:
-            self._run_capture_and_process()
-        finally:
-            self.capture_button.setEnabled(True)
-            self.capture_button.setText(original_button_text)
-            self._is_processing = False
+        self._run_capture_and_process()
 
     def _run_capture_and_process(self) -> None:
-        """Grab a still frame from both cameras and hand them off for operator review (see _enter_document_review) -- the actual face-match/document-validation pipeline runs later, from _on_save_capture_clicked, once the operator confirms (optionally after cropping the document image).
+        """Grab a still frame from both cameras and immediately kick off the face-match/OCR/document-validation pipeline on a background thread (see _start_capture_analysis) -- the scan is saved as soon as that finishes, with no operator review/crop step in between and the live preview never frozen.
+
+        Cropping or brightness/contrast correction, when actually needed, happens after the fact:
+        double-click a saved thumbnail in the history list to open the editor (see
+        ui/image_viewer.py), which can also trigger a re-analysis of the corrected image (reusing
+        the same _start_capture_analysis pipeline via _on_reanalyze_scan_requested) -- rather than
+        blocking every single capture on an optional review step most captures don't need.
 
         If a previous click already got a good frame from one camera but not the other, that held
         frame (self._pending_face_frame / self._pending_doc_frame) is reused instead of recaptured
         -- this click only needs to (re)try whichever side is still missing.
-
-        Everything from the frame-capture check onward that isn't itself an operator-facing
-        decision (i.e. the whole face-match/OCR/MRZ/barcode/save pipeline) is wrapped in a single
-        try/except: previously an exception anywhere in that chain was swallowed by main.py's
-        sys.excepthook (logged to file only, no dialog, no history row added) -- which is exactly
-        what made some clicks look like they silently did nothing at all.
         """
         logger.info("Operator triggered capture & process")
         # np.ndarray has no usable truthiness (a plain `or` raises on a multi-element array), so
@@ -2312,12 +2255,12 @@ class MainWindow(QMainWindow):
         face_frame = (
             self._pending_face_frame
             if self._pending_face_frame is not None
-            else capture_still_frame(self.camera_manager.face_capture)
+            else self.camera_manager.get_face_latest_frame()
         )
         doc_frame = (
             self._pending_doc_frame
             if self._pending_doc_frame is not None
-            else capture_still_frame(self.camera_manager.doc_capture)
+            else self.camera_manager.get_doc_latest_frame()
         )
 
         if face_frame is None or doc_frame is None:
@@ -2340,103 +2283,20 @@ class MainWindow(QMainWindow):
                     "retry just the failed one, or Discard held capture to start over."
                 )
             QMessageBox.warning(self, "Capture failed", message)
+            self._end_capture_processing()
             return
 
         self._pending_face_frame = None
         self._pending_doc_frame = None
         self.discard_pending_button.setVisible(False)
 
-        self._enter_document_review(face_frame, doc_frame)
-
-    def _enter_document_review(self, face_frame: np.ndarray, doc_frame: np.ndarray) -> None:
-        """Freeze both previews on a just-captured frame pair and show the review controls, holding off on the actual face-match/OCR pipeline until the operator explicitly saves.
-
-        Both previews are frozen (via _in_document_review, checked by _update_previews) for visual
-        consistency even though only the document image can be cropped -- the operator is looking
-        at a still pair, not one live feed next to one frozen one.
-        """
-        self._review_face_frame = face_frame
-        self._review_doc_frame = doc_frame
-        self._in_document_review = True
-
-        self._set_preview_pixmap(self.face_preview_label, face_frame)
-        self._set_preview_pixmap(self.doc_preview_label, doc_frame)
-        self.doc_preview_label.reset_crop()
-
-        self.capture_button.setVisible(False)
-        self.crop_toggle_button.setChecked(False)
-        self.review_controls_widget.setVisible(True)
-
-        self.statusBar().showMessage(
-            "Review the capture: optionally draw a crop box on the document image, then Save or Discard."
+        self.capture_button.setText("Processing…")
+        self._start_capture_analysis(
+            face_frame,
+            doc_frame,
+            on_finished=lambda analysis: self._finish_save_capture(analysis, face_frame, doc_frame),
+            on_failed=self._on_save_capture_failed,
         )
-        logger.info("Capture held for operator review")
-
-    def _exit_document_review(self) -> None:
-        """Drop the held review frame pair and return to the normal live-preview capture button, whether the operator saved or discarded."""
-        self._review_face_frame = None
-        self._review_doc_frame = None
-        self._in_document_review = False
-        self.doc_preview_label.reset_crop()
-        self._set_crop_mode_enabled(False)
-        self.crop_toggle_button.setChecked(False)
-        self.review_controls_widget.setVisible(False)
-        self.capture_button.setVisible(True)
-
-    def _on_toggle_crop_mode_clicked(self, checked: bool) -> None:
-        self._set_crop_mode_enabled(checked)
-
-    def _set_crop_mode_enabled(self, enabled: bool) -> None:
-        self.doc_preview_label.crop_mode_enabled = enabled
-        self.doc_preview_label.setCursor(Qt.CursorShape.CrossCursor if enabled else Qt.CursorShape.ArrowCursor)
-
-    def _on_clear_crop_clicked(self) -> None:
-        self.doc_preview_label.reset_crop()
-
-    def _on_discard_capture_clicked(self) -> None:
-        """Drop a reviewed frame pair without processing or saving it -- the operator retakes from scratch with a fresh Capture click."""
-        logger.info("Operator discarded a reviewed capture")
-        self._exit_document_review()
-
-    def _crop_rect_to_frame_bounds(self, label: QLabel, frame: np.ndarray) -> tuple[int, int, int, int] | None:
-        """Convert the crop rectangle the operator dragged on `label` (in on-screen label pixels) into (x1, y1, x2, y2) pixel bounds within `frame`'s own resolution, or None if there's no usable selection.
-
-        None covers both "no rectangle drawn" and "drawn but too small or entirely outside the
-        displayed image" -- either way the caller should fall back to using the frame uncropped,
-        exactly as if the operator had clicked Save without ever entering crop mode. The displayed
-        pixmap's rect is recovered from its own size centered in the label (matching the
-        AlignCenter alignment _build_preview_label sets), since a KeepAspectRatio scale can
-        letterbox the pixmap smaller than the label itself.
-        """
-        crop_rect: QRect | None = getattr(label, "crop_rect", None)
-        if crop_rect is None or crop_rect.isNull():
-            return None
-        if crop_rect.width() < _MIN_CROP_DRAG_PX or crop_rect.height() < _MIN_CROP_DRAG_PX:
-            return None
-
-        pixmap = label.pixmap()
-        if pixmap is None or pixmap.isNull():
-            return None
-        displayed_rect = QRect(
-            (label.width() - pixmap.width()) // 2,
-            (label.height() - pixmap.height()) // 2,
-            pixmap.width(),
-            pixmap.height(),
-        )
-        clipped = crop_rect.intersected(displayed_rect)
-        if clipped.width() < _MIN_CROP_DRAG_PX or clipped.height() < _MIN_CROP_DRAG_PX:
-            return None
-
-        frame_height, frame_width = frame.shape[:2]
-        scale_x = frame_width / displayed_rect.width()
-        scale_y = frame_height / displayed_rect.height()
-        x1 = max(int((clipped.left() - displayed_rect.left()) * scale_x), 0)
-        y1 = max(int((clipped.top() - displayed_rect.top()) * scale_y), 0)
-        x2 = min(int((clipped.right() + 1 - displayed_rect.left()) * scale_x), frame_width)
-        y2 = min(int((clipped.bottom() + 1 - displayed_rect.top()) * scale_y), frame_height)
-        if x2 <= x1 or y2 <= y1:
-            return None
-        return x1, y1, x2, y2
 
     def _start_capture_analysis(
         self,
@@ -2499,43 +2359,14 @@ class MainWindow(QMainWindow):
         self._capture_analysis_worker = worker
         thread.start()
 
-    def _on_save_capture_clicked(self) -> None:
-        """Entry point for the review controls' Save button: applies any drawn document crop, then kicks off the face-match/OCR/document-validation pipeline on a background thread (see _start_capture_analysis) and returns immediately -- _finish_save_capture/_on_save_capture_failed pick up once it's done."""
-        if self._is_processing:
-            return
-        face_frame = self._review_face_frame
-        doc_frame = self._review_doc_frame
-        if face_frame is None or doc_frame is None:
-            return
-
-        crop_bounds = self._crop_rect_to_frame_bounds(self.doc_preview_label, doc_frame)
-        if crop_bounds is not None:
-            x1, y1, x2, y2 = crop_bounds
-            doc_frame = doc_frame[y1:y2, x1:x2].copy()
-            logger.info("Operator cropped document image to %dx%d before processing", x2 - x1, y2 - y1)
-
-        self._exit_document_review()
-
-        self._is_processing = True
-        self._capture_button_original_text = self.capture_button.text()
-        self.capture_button.setEnabled(False)
-        self.capture_button.setText("Processing…")
-
-        self._start_capture_analysis(
-            face_frame,
-            doc_frame,
-            on_finished=lambda analysis: self._finish_save_capture(analysis, face_frame, doc_frame),
-            on_failed=self._on_save_capture_failed,
-        )
-
     def _end_capture_processing(self) -> None:
-        """Restore the capture button and clear the processing guard -- the shared tail end of every path out of _on_save_capture_clicked's background analysis (success or failure)."""
+        """Restore the capture button and clear the processing guard -- the shared tail end of every path out of _run_capture_and_process (a failed camera read, a failed background analysis, or a successfully saved scan)."""
         self.capture_button.setEnabled(True)
         self.capture_button.setText(self._capture_button_original_text)
         self._is_processing = False
 
     def _on_save_capture_failed(self) -> None:
-        """Handle _start_capture_analysis's worker raising during a Save -- mirrors the except branch _finish_save_capture itself still has for errors in the (fast, synchronous) save/DB-write step below the analysis."""
+        """Handle _start_capture_analysis's worker raising during a capture -- mirrors the except branch _finish_save_capture itself still has for errors in the (fast, synchronous) save/DB-write step below the analysis."""
         self._end_capture_processing()
         QMessageBox.critical(
             self,
@@ -2586,7 +2417,10 @@ class MainWindow(QMainWindow):
                 analysis.doc_classification.doc_type,
             )
 
-            self._add_history_row(get_scan_by_id(self.conn, scan_id))
+            new_scan = get_scan_by_id(self.conn, scan_id)
+            all_scans = list_scans(self.conn, limit=100_000)
+            self._add_history_row(new_scan, all_scans=all_scans)
+            self._refresh_same_person_rows(new_scan, all_scans)
             self._apply_filters()
             self._refresh_status_bar_stats()
             self.statusBar().showMessage(f"✓ Scan #{scan_id} saved", 4000)
@@ -2749,13 +2583,25 @@ class MainWindow(QMainWindow):
         Declines to close while a capture or re-analysis is still running on its background thread
         (see _start_capture_analysis) -- letting the window close out from under it would either
         silently lose that scan (it's saved only once the thread's result comes back) or risk
-        tearing down the QThread while it's still running.
+        tearing down the QThread while it's still running. Same reasoning for a camera backend
+        switch still running on Settings' own background thread (see SettingsWindow.
+        _on_backend_changed) -- release_all() below would race its still-in-flight release/reopen
+        of the very same camera handles.
         """
         if self._is_processing:
             QMessageBox.information(
                 self,
                 "Please wait",
                 "A capture or re-analysis is still being processed -- please wait for it to finish before closing.",
+            )
+            if event is not None:
+                event.ignore()
+            return
+        if self._settings_window is not None and self._settings_window.is_backend_switch_in_progress():
+            QMessageBox.information(
+                self,
+                "Please wait",
+                "A camera backend change is still being applied -- please wait for it to finish before closing.",
             )
             if event is not None:
                 event.ignore()

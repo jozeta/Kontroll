@@ -10,6 +10,7 @@ build/
 dist/
 release/
 *.spec
+*.zip
 
 # Runtime-generated data now lives under %LOCALAPPDATA%\Kontroll\, not the project directory
 # (see config/app_paths.py) -- these are only ignored defensively in case older code or a stray

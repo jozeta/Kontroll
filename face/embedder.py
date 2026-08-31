@@ -4,7 +4,7 @@ import numpy as np
 from insightface.app.common import Face
 
 
-def _face_bbox_area(face: Face) -> float:
+def face_bbox_area(face: Face) -> float:
     x1, y1, x2, y2 = face.bbox
     return (x2 - x1) * (y2 - y1)
 
@@ -28,5 +28,5 @@ def get_best_face_embedding(faces: list[Face]) -> np.ndarray | None:
     """
     if len(faces) == 0:
         return None
-    best_face = max(faces, key=_face_bbox_area)
+    best_face = max(faces, key=face_bbox_area)
     return best_face.normed_embedding

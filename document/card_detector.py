@@ -103,13 +103,21 @@ def _warp_to_upright_card(frame: np.ndarray, corners: np.ndarray) -> np.ndarray 
     return cv2.warpPerspective(frame, transform, (int(round(dest_width)), int(round(dest_height))))
 
 
-def detect_and_crop_card(frame: np.ndarray) -> np.ndarray:
-    """Return a perspective-corrected, cropped-and-upscaled view of the card-shaped bright region in frame, or frame itself unchanged if no confident match is found."""
+def find_card_corners(frame: np.ndarray) -> np.ndarray | None:
+    """Locate the card-shaped bright region in frame and return its 4 corner points (margin
+    already applied, clamped to the frame), or None if no confident match is found.
+
+    Split out from detect_and_crop_card so a caller that only needs to know roughly *where* the
+    card is -- e.g. ui/image_viewer.py's zoom-to-card framing, which zooms the original frame
+    rather than needing a perspective-corrected copy of it -- doesn't have to duplicate this
+    detection heuristic. detect_and_crop_card itself is unchanged in behavior, just now built on
+    top of this.
+    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     _, thresholded = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     contours, _ = cv2.findContours(thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
-        return frame
+        return None
 
     frame_height, frame_width = frame.shape[:2]
     frame_area = frame_height * frame_width
@@ -138,7 +146,7 @@ def detect_and_crop_card(frame: np.ndarray) -> np.ndarray:
             best_rect = rect
 
     if best_rect is None:
-        return frame
+        return None
 
     corners = cv2.boxPoints(best_rect)
     # Grows the quadrilateral uniformly outward from its own center by the margin fraction (rather
@@ -150,6 +158,30 @@ def detect_and_crop_card(frame: np.ndarray) -> np.ndarray:
     corners = center + (corners - center) * (1 + 2 * _CROP_MARGIN_RATIO)
     corners[:, 0] = np.clip(corners[:, 0], 0, frame_width - 1)
     corners[:, 1] = np.clip(corners[:, 1], 0, frame_height - 1)
+    return corners
+
+
+def find_card_bounding_box(frame: np.ndarray) -> tuple[int, int, int, int] | None:
+    """Return the axis-aligned bounding box (x1, y1, x2, y2) of the card-shaped region found in
+    frame, or None -- for a caller that wants to know roughly where the card is in the original,
+    unrotated frame (e.g. ui/image_viewer.py's zoom-to-card framing) rather than a perspective-
+    corrected, upright, cropped-and-upscaled copy of it (see detect_and_crop_card for that)."""
+    corners = find_card_corners(frame)
+    if corners is None:
+        return None
+    return (
+        int(round(corners[:, 0].min())),
+        int(round(corners[:, 1].min())),
+        int(round(corners[:, 0].max())),
+        int(round(corners[:, 1].max())),
+    )
+
+
+def detect_and_crop_card(frame: np.ndarray) -> np.ndarray:
+    """Return a perspective-corrected, cropped-and-upscaled view of the card-shaped bright region in frame, or frame itself unchanged if no confident match is found."""
+    corners = find_card_corners(frame)
+    if corners is None:
+        return frame
 
     ordered_corners = _order_corners_clockwise(corners)
     warped = _warp_to_upright_card(frame, ordered_corners)
