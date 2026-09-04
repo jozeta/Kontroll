@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from pathlib import Path
 
 from PyQt6.QtWidgets import QMessageBox, QWidget
 
+from capture.dshow_native_formats import list_video_input_device_names
 from config.bundled_deps import (
     INSIGHTFACE_LEGACY_MODEL_FILE,
     INSIGHTFACE_MODEL_FILE,
@@ -207,20 +209,41 @@ def check_insightface_model() -> PrerequisiteStatus:
 
 
 def check_cameras() -> PrerequisiteStatus:
-    """Confirm at least two UVC cameras are currently detected. Informational only -- missing cameras can't be auto-installed."""
+    """Confirm at least two UVC cameras are currently detected. Informational only -- missing cameras can't be auto-installed.
+
+    Runs at every app startup, before the main window (or even the splash screen's event loop) is
+    pumping events -- previously the slowest single step of the whole prerequisite check, since it
+    blindly opened+read device indices 0..9 in turn (cv2.VideoCapture(index, CAP_DSHOW) is a real,
+    multi-second-capable DirectShow hardware round trip per index) regardless of how many cameras
+    were actually attached, with nothing pumping the event loop meanwhile to keep it from reading as
+    a full app freeze. list_video_input_device_names() queries DirectShow's own device registry
+    first -- a near-instant metadata call that touches no hardware -- so this now only opens the
+    indices that actually correspond to a registered device; if that query itself fails (e.g.
+    pygrabber unavailable), this falls back to the previous blind 0..9 loop unchanged.
+    """
     try:
         import cv2
     except ImportError:
         return PrerequisiteStatus("Cameras", False, "Cannot check -- OpenCV is not installed", can_auto_install=False)
 
+    started_at = time.monotonic()
+    device_names = list_video_input_device_names()
+    candidate_indices = list(range(min(len(device_names), 10))) if device_names else list(range(10))
+    logger.info(
+        "Camera prerequisite check: %s device name(s) found via fast DirectShow enumeration; "
+        "probing index(es) %s",
+        len(device_names) if device_names else "no", candidate_indices,
+    )
+
     detected_count = 0
-    for index in range(10):
+    for index in candidate_indices:
         capture = cv2.VideoCapture(index, cv2.CAP_DSHOW)
         if capture.isOpened():
             was_read, _frame = capture.read()
             if was_read:
                 detected_count += 1
         capture.release()
+    logger.info("Camera prerequisite check found %d camera(s) in %.2fs", detected_count, time.monotonic() - started_at)
 
     if detected_count >= 2:
         return PrerequisiteStatus("Cameras", True, f"{detected_count} camera(s) detected", can_auto_install=False)

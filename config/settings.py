@@ -73,6 +73,15 @@ DEFAULT_CAPTURE_SHORTCUT: str = "F12"
 # value -- same unvalidated-default caveat as DEFAULT_FACE_MATCH_THRESHOLD above.
 DEFAULT_DISK_SPACE_WARNING_MB: int = 2000
 
+# How many scans ui/main_window.py's history list loads at a time -- the initial batch shown on
+# load/reload, and each further chunk loaded as the operator scrolls near the bottom (see
+# MainWindow._load_more_rows). 30 is a rough starting point (a comfortable single screenful
+# without much scrolling), not a calibrated value -- an operator can raise or lower it in Settings
+# depending on their screen size/preference. Kept small deliberately: HistoryRowWidget construction
+# does a real, synchronous full-resolution cv2.imread + rescale per image (two images per row), so
+# a much larger chunk size directly costs more time on every load/scroll-triggered fetch.
+DEFAULT_HISTORY_PAGE_SIZE: int = 30
+
 # "system" defers to whatever palette PyQt6/the OS hands the app by default; "light"/"dark" force
 # an explicit QPalette override -- see ui/theme.py.
 DEFAULT_THEME: str = "system"
@@ -102,6 +111,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "doc_camera_backend": DEFAULT_CAMERA_BACKEND_SETTING,
     "capture_shortcut": DEFAULT_CAPTURE_SHORTCUT,
     "disk_space_warning_mb": str(DEFAULT_DISK_SPACE_WARNING_MB),
+    "history_page_size": str(DEFAULT_HISTORY_PAGE_SIZE),
     "theme": DEFAULT_THEME,
     "debug_logging_enabled": DEFAULT_DEBUG_LOGGING_ENABLED,
 }
@@ -255,6 +265,11 @@ def get_capture_shortcut(conn: sqlite3.Connection) -> str:
 def get_disk_space_warning_mb(conn: sqlite3.Connection) -> int:
     """Typed convenience accessor for the disk_space_warning_mb setting."""
     return int(get_setting(conn, "disk_space_warning_mb"))
+
+
+def get_history_page_size(conn: sqlite3.Connection) -> int:
+    """Typed convenience accessor for the history_page_size setting."""
+    return int(get_setting(conn, "history_page_size"))
 
 
 def get_theme(conn: sqlite3.Connection) -> str:

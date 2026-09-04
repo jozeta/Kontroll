@@ -74,6 +74,15 @@ def apply_debug_logging_setting(enabled: bool) -> None:
     so an operator can turn on verbose logging to diagnose a reported issue without restarting.
     """
     logging.getLogger().setLevel(logging.DEBUG if enabled else logging.INFO)
+    # comtypes (pulled in transitively by pygrabber, used for native DirectShow format/device
+    # enumeration -- see capture/dshow_native_formats.py) logs one line per raw COM call/pointer
+    # release at DEBUG, which is internal plumbing noise rather than camera information an operator
+    # would ever want out of "verbose logging" -- left at root's own level, capture/camera_manager.py
+    # ::_log_verbose_camera_snapshot's now-automatic per-camera-open dump (the actual useful signal
+    # this setting is meant to surface) would otherwise be buried under hundreds of "Release
+    # <POINTER(...)>" lines per camera open. Set unconditionally (not just when enabled) so toggling
+    # debug logging off again doesn't matter either way -- this logger is never useful at DEBUG here.
+    logging.getLogger("comtypes").setLevel(logging.WARNING)
     logger.info("Debug logging %s", "enabled" if enabled else "disabled")
 
 

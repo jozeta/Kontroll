@@ -5,6 +5,7 @@ import base64
 import logging
 import shutil
 import sqlite3
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -52,10 +53,12 @@ from capture.camera_manager import (
     enumerate_cameras,
     gather_camera_diagnostics,
     probe_supported_resolutions,
+    resolutions_from_native_formats,
     set_best_available_resolution,
     set_exact_resolution,
     set_lowest_available_resolution,
 )
+from capture.dshow_native_formats import list_native_formats
 from config.app_paths import (
     DB_DIR_KEY,
     DOCUMENTS_DIR_KEY,
@@ -85,6 +88,7 @@ from config.settings import (
     get_face_camera_exposure,
     get_face_camera_resolution,
     get_face_match_threshold,
+    get_history_page_size,
     get_retention_days,
     get_setting_or_none,
     get_theme,
@@ -694,6 +698,7 @@ class SettingsWindow(QWidget):
         layout.addWidget(self._build_appearance_group())
         layout.addWidget(self._build_shortcut_group())
         layout.addWidget(self._build_disk_space_warning_group())
+        layout.addWidget(self._build_history_page_size_group())
         layout.addWidget(self._build_logging_group())
         layout.addStretch(1)
         return page
@@ -1140,6 +1145,36 @@ class SettingsWindow(QWidget):
         QMessageBox.information(self, "Disk space warning", f"Warning threshold set to {new_threshold_mb} MB.")
         self._on_data_changed()  # refreshes the main window's status bar immediately, not just on next capture
 
+    # -- History list loading -----------------------------------------------------------------------
+
+    def _build_history_page_size_group(self) -> QGroupBox:
+        group = QGroupBox("History list")
+        row = QHBoxLayout(group)
+        row.addWidget(QLabel("Scans loaded at a time:"))
+
+        self.history_page_size_spin = QSpinBox()
+        # Floor of 5 keeps at least a useful initial batch even at the low end; no particular
+        # ceiling reason for 500 beyond "large enough that anyone wanting more is really asking to
+        # just load everything at once" -- each row is a real per-image decode cost (see
+        # DEFAULT_HISTORY_PAGE_SIZE's own comment), so this isn't meant to invite a huge value.
+        self.history_page_size_spin.setRange(5, 500)
+        self.history_page_size_spin.setValue(get_history_page_size(self.conn))
+        row.addWidget(self.history_page_size_spin)
+
+        save_button = QPushButton("Save")
+        save_button.clicked.connect(self._on_save_history_page_size_clicked)
+        row.addWidget(save_button)
+        row.addStretch(1)
+
+        return group
+
+    def _on_save_history_page_size_clicked(self) -> None:
+        new_page_size = self.history_page_size_spin.value()
+        set_setting(self.conn, "history_page_size", str(new_page_size))
+        logger.info("Operator set the history list load-batch size to %d", new_page_size)
+        QMessageBox.information(self, "History list", f"The history list will now load {new_page_size} scans at a time.")
+        self._on_data_changed()  # reloads the main window's history list at the new batch size immediately
+
     # -- Logging ------------------------------------------------------------------------------------
 
     def _build_logging_group(self) -> QGroupBox:
@@ -1153,9 +1188,12 @@ class SettingsWindow(QWidget):
 
         info_label = QLabel(
             "Adds extra detail to the log file (see the log file location under the Data tab) -- "
-            "capture-pipeline stage timings, slow camera reads, and other diagnostic detail not "
-            "needed for routine operation. Useful when reporting a bug or a slowdown; takes effect "
-            "immediately, no restart needed. Leave off for normal day-to-day use."
+            "capture-pipeline stage timings, slow camera reads, a full driver-reported snapshot "
+            "(resolution, negotiated compression, exposure/gain/focus/etc., and every natively "
+            "advertised mode) of each camera every time it's opened, reopened, or switched, and "
+            "other diagnostic detail not needed for routine operation. Useful when reporting a bug "
+            "or a slowdown; takes effect immediately, no restart needed. Leave off for normal "
+            "day-to-day use."
         )
         info_label.setWordWrap(True)
         info_label.setStyleSheet("color: gray;")
@@ -1166,6 +1204,13 @@ class SettingsWindow(QWidget):
     def _on_debug_logging_toggled(self, checked: bool) -> None:
         set_setting(self.conn, "debug_logging_enabled", "1" if checked else "0")
         logging.getLogger().setLevel(logging.DEBUG if checked else logging.INFO)
+        # comtypes (pulled in transitively by pygrabber for native DirectShow format/device
+        # enumeration) logs one line per raw COM call/pointer release at DEBUG -- internal plumbing
+        # noise, not camera information -- which would otherwise bury capture/camera_manager.py's own
+        # useful per-camera-open verbose dump; see main.py::apply_debug_logging_setting's matching
+        # startup-time suppression, mirrored here since this toggle sets the level live without going
+        # through that function.
+        logging.getLogger("comtypes").setLevel(logging.WARNING)
         logger.info("Operator %s debug logging", "enabled" if checked else "disabled")
 
     # -- Backup -----------------------------------------------------------------------------------
@@ -1548,8 +1593,9 @@ class SettingsWindow(QWidget):
             "it actually negotiates. If a camera keeps falling back to an uncompressed format at "
             "every resolution despite working fine in other applications, try switching its Backend "
             "to Media Foundation above -- some camera/driver combinations negotiate compression far "
-            "more reliably over it than the default DirectShow backend. Detecting the list below "
-            "takes a couple of seconds per camera."
+            "more reliably over it than the default DirectShow backend. Detecting the list below is "
+            "usually near-instant; it falls back to a slower (couple-of-seconds-per-camera) hardware "
+            "probe only if the fast method isn't available for this camera."
         )
         info_label.setWordWrap(True)
         info_label.setStyleSheet("color: gray;")
@@ -1624,27 +1670,48 @@ class SettingsWindow(QWidget):
         combo.blockSignals(False)
 
     def _refresh_resolution_combo(self, side: str) -> None:
-        """Probe the given camera's actually-supported resolutions (a real hardware round-trip, ~1-2s) and repopulate its combo, preserving the currently configured selection.
+        """Repopulate the given camera's resolution combo, preserving the currently configured selection.
 
-        Pumps the event loop between each of the ~10 candidates tried (rather than blocking the
-        whole ~1-2s straight through) so the app stays responsive and doesn't read as frozen --
-        the live-preview poll is paused for the same span, since it would otherwise read from this
-        same capture concurrently with the probe's own capture.set()/.read() calls whenever a
-        pumped event lets its timer fire.
+        Tries the fast path first: list_native_formats queries DirectShow's own advertised
+        (compression, resolution) modes directly (a metadata call, no capture.read() at all -- see
+        that function's own docstring), so resolutions_from_native_formats can usually build the
+        combo's contents near-instantly instead of the previous unconditional ~1-2s real hardware
+        round trip (probe_supported_resolutions, ~10 candidate resolutions each requiring a real
+        capture.set()+read()). Only falls back to that slow probe if the fast metadata query itself
+        comes back empty (e.g. pygrabber unavailable, or this device doesn't expose IAMStreamConfig)
+        -- pumping the event loop between each of its ~10 candidates so the app stays responsive
+        instead of reading as frozen, and pausing the live-preview poll for that same span since it
+        would otherwise read from this same capture concurrently with the probe's own calls whenever
+        a pumped event lets its timer fire.
         """
         combo = self.face_resolution_combo if side == "face" else self.doc_resolution_combo
         capture = self.camera_manager.face_capture if side == "face" else self.camera_manager.doc_capture
+        camera_index = self.camera_manager.face_camera_index if side == "face" else self.camera_manager.doc_camera_index
         current_resolution = get_face_camera_resolution(self.conn) if side == "face" else get_doc_camera_resolution(self.conn)
 
-        self._on_camera_probe_started()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            resolutions = probe_supported_resolutions(
-                capture, on_candidate_tried=lambda _width, _height: QApplication.processEvents()
+        started_at = time.monotonic()
+        resolutions = resolutions_from_native_formats(list_native_formats(camera_index))
+        used_fast_path = bool(resolutions)
+
+        if used_fast_path:
+            logger.info(
+                "Refreshed %s camera (index %d) resolution list from native DirectShow format "
+                "metadata in %.2fs -- no hardware probe needed", side, camera_index, time.monotonic() - started_at,
             )
-        finally:
-            QApplication.restoreOverrideCursor()
-            self._on_camera_probe_finished()
+        else:
+            self._on_camera_probe_started()
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                resolutions = probe_supported_resolutions(
+                    capture, on_candidate_tried=lambda _width, _height: QApplication.processEvents()
+                )
+            finally:
+                QApplication.restoreOverrideCursor()
+                self._on_camera_probe_finished()
+            logger.info(
+                "Refreshed %s camera (index %d) resolution list via hardware probe in %.2fs (native "
+                "format metadata was unavailable)", side, camera_index, time.monotonic() - started_at,
+            )
 
         combo.blockSignals(True)
         combo.clear()
@@ -1660,14 +1727,16 @@ class SettingsWindow(QWidget):
         combo.setCurrentIndex(target_index if target_index >= 0 else 0)
         combo.blockSignals(False)
 
-        # Probing above leaves the capture set to whichever candidate it tried last -- restore it
-        # to whatever is actually configured so the live preview doesn't stay on a stray mode.
-        if isinstance(current_resolution, tuple):
-            set_exact_resolution(capture, current_resolution)
-        elif current_resolution == AUTO_LOWEST:
-            set_lowest_available_resolution(capture)
-        else:
-            set_best_available_resolution(capture)
+        # The slow probe above leaves the capture set to whichever candidate it tried last -- restore
+        # it to whatever is actually configured so the live preview doesn't stay on a stray mode.
+        # Not needed on the fast metadata path, which never touches the live capture at all.
+        if not used_fast_path:
+            if isinstance(current_resolution, tuple):
+                set_exact_resolution(capture, current_resolution)
+            elif current_resolution == AUTO_LOWEST:
+                set_lowest_available_resolution(capture)
+            else:
+                set_best_available_resolution(capture)
 
     def _on_resolution_changed(self, side: str) -> None:
         combo = self.face_resolution_combo if side == "face" else self.doc_resolution_combo

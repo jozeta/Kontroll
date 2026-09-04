@@ -9,7 +9,7 @@ from typing import Callable, Final, Literal
 import cv2
 import numpy as np
 
-from capture.dshow_native_formats import NativeFormat, list_native_formats
+from capture.dshow_native_formats import NativeFormat, list_native_formats, list_video_input_device_names
 
 logger = logging.getLogger(__name__)
 
@@ -292,20 +292,44 @@ def _safe_read(capture: cv2.VideoCapture) -> tuple[bool, np.ndarray | None]:
 
 
 def enumerate_cameras(max_index: int = 10, on_index_tried: Callable[[int], None] | None = None) -> list[CameraInfo]:
-    """Probe device indices 0..max_index-1 and return the ones that open and yield a readable frame.
+    """Return every camera that opens and yields a readable frame, checking only indices a device
+    is actually registered at rather than blindly trying every index 0..max_index-1.
 
-    OpenCV/Windows has no API to list UVC devices by name, so this is the standard way to discover
-    which indices correspond to actually-connected cameras: open each index, try to read one frame,
-    and keep only the ones that succeed. Devices are labeled generically by index since no
-    human-readable name is available this way.
+    Previously this always opened+read all `max_index` (10) indices in turn regardless of how many
+    cameras were actually attached -- each open is a real, multi-second-capable DirectShow hardware
+    round trip, so a 1-2 camera desk still paid for 8-9 pointless opens of nonexistent devices every
+    time this ran (at every app startup via prerequisites.check_cameras, and every time Settings'
+    Cameras tab was opened). `list_video_input_device_names` queries DirectShow's own device
+    registry first -- a near-instant metadata call that touches no hardware -- so this only opens
+    the indices that actually correspond to a registered device; if that query itself fails (e.g.
+    pygrabber unavailable), this falls back to the previous blind 0..max_index-1 loop, so camera
+    detection never regresses, only speeds up in the common case. Discovered cameras are labeled
+    with their real device name when available, generically by index otherwise.
 
     on_index_tried, if given, is called (with the index just tried) after each one -- this module
     has no GUI dependency of its own, but a caller running a Qt event loop can pass e.g.
-    QApplication.processEvents to keep the app responsive across this multi-second, multi-device
-    blocking operation instead of it reading as a freeze (see ui/settings_window.py).
+    QApplication.processEvents to keep the app responsive across this operation instead of it
+    reading as a freeze (see ui/settings_window.py). Kept even though the fast path above usually
+    makes this whole function quick, since the blind-probing fallback path still needs it.
     """
+    started_at = time.monotonic()
+    device_names = list_video_input_device_names()
+    if device_names:
+        candidate_indices = list(range(min(len(device_names), max_index)))
+        logger.info(
+            "Fast DirectShow device enumeration found %d registered video input device(s) (%s); "
+            "probing only those indices instead of blindly trying 0..%d",
+            len(device_names), device_names, max_index - 1,
+        )
+    else:
+        candidate_indices = list(range(max_index))
+        logger.info(
+            "Fast DirectShow device enumeration returned no devices (pygrabber unavailable, or a "
+            "COM error) -- falling back to blindly probing indices 0..%d", max_index - 1,
+        )
+
     discovered: list[CameraInfo] = []
-    for index in range(max_index):
+    for index in candidate_indices:
         # CAP_DSHOW (DirectShow) is used instead of the Windows default (Media Foundation)
         # because MSMF is known to be slow/unreliable when repeatedly opening and closing
         # device indices during enumeration, which this probing loop does by nature.
@@ -313,10 +337,16 @@ def enumerate_cameras(max_index: int = 10, on_index_tried: Callable[[int], None]
         if capture.isOpened():
             was_read, _frame = _safe_read(capture)
             if was_read:
-                discovered.append(CameraInfo(index=index, label=f"Camera {index}"))
+                name = device_names[index] if index < len(device_names) else None
+                label = f"{name} (index {index})" if name else f"Camera {index}"
+                discovered.append(CameraInfo(index=index, label=label))
         capture.release()
         if on_index_tried is not None:
             on_index_tried(index)
+    logger.info(
+        "Camera enumeration found %d camera(s) in %.2fs (checked %d index(es): %s)",
+        len(discovered), time.monotonic() - started_at, len(candidate_indices), candidate_indices,
+    )
     return discovered
 
 
@@ -389,6 +419,7 @@ def probe_supported_resolutions(
     see enumerate_cameras' docstring for why (this is the ~1-2s-per-camera operation that
     docstring's ui/settings_window.py reference is about).
     """
+    started_at = time.monotonic()
     found: list[tuple[int, int, str]] = []
     seen_sizes: set[tuple[int, int]] = set()
     for width, height in _RESOLUTION_CANDIDATES:
@@ -399,7 +430,33 @@ def probe_supported_resolutions(
         if on_candidate_tried is not None:
             on_candidate_tried(width, height)
     found.sort(key=lambda resolution: resolution[0] * resolution[1], reverse=True)
+    logger.info(
+        "Hardware resolution probe tried %d candidate(s) and found %d supported resolution(s) in %.2fs",
+        len(_RESOLUTION_CANDIDATES), len(found), time.monotonic() - started_at,
+    )
     return found
+
+
+def resolutions_from_native_formats(native_formats: list[NativeFormat]) -> list[tuple[int, int, str]]:
+    """Collapse a camera's exact native DirectShow modes (see dshow_native_formats.list_native_formats)
+    down to one (width, height, fourcc) entry per distinct resolution, in the same shape and sort
+    order (highest resolution first) as probe_supported_resolutions -- so a caller that only needs
+    "what resolutions does this camera support" can use this fast metadata query (no capture.read()
+    at all, see list_native_formats' own docstring) instead of that function's real, ~1-2s-per-
+    camera hardware round trip. A native format list commonly repeats the same resolution once per
+    supported framerate and/or compression; MJPG is preferred over any other compression found at
+    the same resolution, mirroring the preference _best_candidate_preferring_compression applies
+    when actually choosing a resolution to use.
+    """
+    best_fourcc_by_size: dict[tuple[int, int], str] = {}
+    for native_format in native_formats:
+        size = (native_format.width, native_format.height)
+        current = best_fourcc_by_size.get(size)
+        if current is None or (current.upper() != REQUESTED_FOURCC.upper() and native_format.fourcc.upper() == REQUESTED_FOURCC.upper()):
+            best_fourcc_by_size[size] = native_format.fourcc
+    resolutions = [(width, height, fourcc) for (width, height), fourcc in best_fourcc_by_size.items()]
+    resolutions.sort(key=lambda resolution: resolution[0] * resolution[1], reverse=True)
+    return resolutions
 
 
 def _best_candidate_preferring_compression(
@@ -489,6 +546,32 @@ def _measured_fps(timestamps: list[float]) -> float:
     return (len(timestamps) - 1) / (timestamps[-1] - timestamps[0])
 
 
+def _log_verbose_camera_snapshot(label: str, capture: cv2.VideoCapture, camera_index: int, backend: int) -> None:
+    """Log a full point-in-time snapshot of one camera -- every curated driver-reported property
+    (see _DIAGNOSTIC_PROPERTY_LABELS) plus its exact native DirectShow formats -- at DEBUG level.
+
+    Gated on logger.isEnabledFor(DEBUG) so this (a real COM round trip for the native-format query,
+    on top of a handful of property reads) only runs when an operator has actually turned on verbose
+    logging (config.settings' debug_logging_enabled, applied via main.py::apply_debug_logging_setting
+    before CameraManager is ever constructed) -- never on an ordinary camera open/reopen/switch.
+    This is what turns "operator turned on verbose logging to diagnose a camera issue" into a
+    complete snapshot landing in app.log on its own, without a separate trip through Settings ->
+    Cameras -> Export diagnostics (which remains the on-demand, UI-visible equivalent -- see
+    gather_camera_diagnostics -- and additionally probes actually-negotiable resolutions, which this
+    does not, to stay cheap enough to run on every open).
+    """
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    properties = {prop_label: capture.get(prop_id) for prop_label, prop_id in _DIAGNOSTIC_PROPERTY_LABELS}
+    negotiated_fourcc = decode_fourcc(capture.get(cv2.CAP_PROP_FOURCC))
+    backend_name = capture.getBackendName() if hasattr(capture, "getBackendName") else backend_display_name(backend)
+    native_formats = list_native_formats(camera_index)
+    logger.debug(
+        "%s camera index %d verbose snapshot -- backend=%s negotiated_fourcc=%s properties=%s native_formats=%s",
+        label, camera_index, backend_name, negotiated_fourcc, properties, [str(f) for f in native_formats],
+    )
+
+
 def _apply_resolution_preference(capture: cv2.VideoCapture, resolution: ResolutionPreference) -> tuple[int, int] | None:
     """Resolve a ResolutionPreference (an exact size, AUTO_LOWEST, or None for auto-best) against an already-open capture."""
     if resolution is None:
@@ -503,8 +586,14 @@ def _open_camera(
     resolution: ResolutionPreference,
     exposure_settings: ExposureSettings | None = None,
     backend: int = cv2.CAP_DSHOW,
+    label: str = "Camera",
 ) -> cv2.VideoCapture:
     """Open a camera at the given device index and apply the given resolution preference (exact size, AUTO_LOWEST, or None for auto-best) and exposure settings (None defaults to plain auto exposure).
+
+    label ("Face"/"Document", from CameraManager's own two roles) is purely cosmetic, threaded
+    through only so _log_verbose_camera_snapshot's DEBUG-level dump at the end of this function
+    reads clearly in app.log -- see that function's own docstring for when it actually logs
+    anything.
 
     backend picks the underlying Windows capture API (see CAMERA_BACKENDS) -- CAP_DSHOW
     (DirectShow) is the app-wide default (see enumerate_cameras' own comment for why), but some
@@ -563,6 +652,7 @@ def _open_camera(
             "Camera index %d opened via %s at resolution %s (requested %s)",
             index, backend_display_name(backend), applied, resolution or "auto",
         )
+        _log_verbose_camera_snapshot(label, capture, index, backend)
     return capture
 
 
@@ -580,7 +670,11 @@ _BACKEND_SWITCH_RETRY_ATTEMPTS = 3
 
 
 def _open_camera_verified(
-    index: int, resolution: ResolutionPreference, exposure_settings: ExposureSettings | None, backend: int
+    index: int,
+    resolution: ResolutionPreference,
+    exposure_settings: ExposureSettings | None,
+    backend: int,
+    label: str = "Camera",
 ) -> tuple[cv2.VideoCapture, bool]:
     """Open a camera under a specific backend and confirm it actually delivers a frame, retrying a
     few times with a short delay if not, before giving up -- used specifically for an operator-
@@ -597,7 +691,7 @@ def _open_camera_verified(
     persistently failing capture is still returned (never None) so the caller always has *some*
     handle to keep going with, exactly like plain _open_camera's own contract.
     """
-    capture = _open_camera(index, resolution, exposure_settings, backend)
+    capture = _open_camera(index, resolution, exposure_settings, backend, label)
     for attempt in range(_BACKEND_SWITCH_RETRY_ATTEMPTS):
         if capture.isOpened():
             was_read, _frame = _safe_read(capture)
@@ -610,7 +704,7 @@ def _open_camera_verified(
             )
             capture.release()
             time.sleep(_BACKEND_SWITCH_RELEASE_DELAY_SECONDS)
-            capture = _open_camera(index, resolution, exposure_settings, backend)
+            capture = _open_camera(index, resolution, exposure_settings, backend, label)
     return capture, False
 
 
@@ -735,8 +829,8 @@ class CameraManager:
         self._face_backend = face_backend
         self._doc_backend = doc_backend
 
-        face_capture = _open_camera(face_camera_index, face_resolution, self._face_exposure, self._face_backend)
-        doc_capture = _open_camera(doc_camera_index, doc_resolution, self._doc_exposure, self._doc_backend)
+        face_capture = _open_camera(face_camera_index, face_resolution, self._face_exposure, self._face_backend, "Face")
+        doc_capture = _open_camera(doc_camera_index, doc_resolution, self._doc_exposure, self._doc_backend, "Document")
         self._face_reader = _CameraReaderThread("Face", face_camera_index, face_capture)
         self._doc_reader = _CameraReaderThread("Document", doc_camera_index, doc_capture)
 
@@ -806,7 +900,9 @@ class CameraManager:
         logger.warning("Face camera index %d unresponsive; attempting to reopen", self.face_camera_index)
         self._face_reader.pause()
         self._face_reader.capture.release()
-        new_capture = _open_camera(self.face_camera_index, self._face_resolution, self._face_exposure, self._face_backend)
+        new_capture = _open_camera(
+            self.face_camera_index, self._face_resolution, self._face_exposure, self._face_backend, "Face"
+        )
         self._face_reader.replace_capture(new_capture)
         self._face_reader.resume()
 
@@ -814,7 +910,9 @@ class CameraManager:
         logger.warning("Document camera index %d unresponsive; attempting to reopen", self.doc_camera_index)
         self._doc_reader.pause()
         self._doc_reader.capture.release()
-        new_capture = _open_camera(self.doc_camera_index, self._doc_resolution, self._doc_exposure, self._doc_backend)
+        new_capture = _open_camera(
+            self.doc_camera_index, self._doc_resolution, self._doc_exposure, self._doc_backend, "Document"
+        )
         self._doc_reader.replace_capture(new_capture)
         self._doc_reader.resume()
 
@@ -824,7 +922,7 @@ class CameraManager:
         self._face_reader.capture.release()
         self.face_camera_index = index
         self._face_resolution = resolution
-        new_capture = _open_camera(index, resolution, self._face_exposure, self._face_backend)
+        new_capture = _open_camera(index, resolution, self._face_exposure, self._face_backend, "Face")
         self._face_reader.replace_capture(new_capture)
         self._face_reader.resume()
         logger.info("Switched face camera to index %d (opened=%s)", index, new_capture.isOpened())
@@ -835,7 +933,7 @@ class CameraManager:
         self._doc_reader.capture.release()
         self.doc_camera_index = index
         self._doc_resolution = resolution
-        new_capture = _open_camera(index, resolution, self._doc_exposure, self._doc_backend)
+        new_capture = _open_camera(index, resolution, self._doc_exposure, self._doc_backend, "Document")
         self._doc_reader.replace_capture(new_capture)
         self._doc_reader.resume()
         logger.info("Switched document camera to index %d (opened=%s)", index, new_capture.isOpened())
@@ -858,7 +956,7 @@ class CameraManager:
             self._face_reader.capture.release()
             time.sleep(_BACKEND_SWITCH_RELEASE_DELAY_SECONDS)
             new_capture, succeeded = _open_camera_verified(
-                self.face_camera_index, self._face_resolution, self._face_exposure, backend
+                self.face_camera_index, self._face_resolution, self._face_exposure, backend, "Face"
             )
             if not succeeded and backend != previous_backend:
                 logger.warning(
@@ -868,7 +966,7 @@ class CameraManager:
                 new_capture.release()
                 time.sleep(_BACKEND_SWITCH_RELEASE_DELAY_SECONDS)
                 new_capture, _reverted_ok = _open_camera_verified(
-                    self.face_camera_index, self._face_resolution, self._face_exposure, previous_backend
+                    self.face_camera_index, self._face_resolution, self._face_exposure, previous_backend, "Face"
                 )
                 backend = previous_backend
             self._face_backend = backend
@@ -886,7 +984,7 @@ class CameraManager:
             self._doc_reader.capture.release()
             time.sleep(_BACKEND_SWITCH_RELEASE_DELAY_SECONDS)
             new_capture, succeeded = _open_camera_verified(
-                self.doc_camera_index, self._doc_resolution, self._doc_exposure, backend
+                self.doc_camera_index, self._doc_resolution, self._doc_exposure, backend, "Document"
             )
             if not succeeded and backend != previous_backend:
                 logger.warning(
@@ -896,7 +994,7 @@ class CameraManager:
                 new_capture.release()
                 time.sleep(_BACKEND_SWITCH_RELEASE_DELAY_SECONDS)
                 new_capture, _reverted_ok = _open_camera_verified(
-                    self.doc_camera_index, self._doc_resolution, self._doc_exposure, previous_backend
+                    self.doc_camera_index, self._doc_resolution, self._doc_exposure, previous_backend, "Document"
                 )
                 backend = previous_backend
             self._doc_backend = backend

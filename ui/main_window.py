@@ -15,7 +15,7 @@ from typing import Callable
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
-from PyQt6.QtCore import QByteArray, QDate, QObject, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QByteArray, QDate, QObject, QPropertyAnimation, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QCloseEvent,
     QColor,
@@ -58,6 +58,7 @@ from config.settings import (
     get_capture_shortcut,
     get_disk_space_warning_mb,
     get_face_match_threshold,
+    get_history_page_size,
     get_setting_or_none,
     set_setting,
 )
@@ -122,6 +123,12 @@ _PREVIEW_INTERVAL_MS = 33  # ~30fps live preview polling
 _PREVIEW_SIZE = (320, 240)
 _THUMBNAIL_SIZE = (110, 82)
 
+# How long the camera-flash-style white overlay takes to fade back out after a capture -- see
+# _FlashCapableLabel.flash_white/MainWindow._flash_capture_previews. Short enough to read as a
+# quick "dip", not a lingering wash-out that would still be fading while the operator is already
+# looking at the next visitor.
+_CAPTURE_FLASH_FADE_MS = 250
+
 # How many preview ticks between live blur checks on the document camera (see
 # MainWindow._update_doc_quality_warning) -- roughly 3 times/sec at _PREVIEW_INTERVAL_MS, cheap
 # enough to stay responsive without running a Laplacian convolution over the whole frame on every
@@ -153,6 +160,13 @@ _DEFAULT_VISIBLE_HISTORY_ROWS = 5
 # small/low-resolution screen even with the top pane (previews + capture button, pinned to its own
 # fixed height by resizeEvent) taking up its share.
 _MIN_VISIBLE_HISTORY_ROWS = 2
+
+# How close (in pixels) to the bottom of the history list's scrollbar the operator has to scroll
+# before the next chunk of scans loads -- see MainWindow._on_history_scrolled/_load_more_rows.
+# Loading a little before the true bottom (rather than only once it's fully reached) means the
+# next chunk is usually already in place by the time the operator actually gets there, instead of
+# a visible pause right as they hit the end of the currently-loaded rows.
+_HISTORY_SCROLL_LOAD_MORE_THRESHOLD_PX = 300
 
 # settings-table keys the window's size/position and the top pane's height are persisted under
 # (see MainWindow._restore_window_state / _save_window_state). The geometry is base64 text
@@ -614,9 +628,12 @@ class HistoryRowWidget(QFrame):
         self._on_selection_toggled = on_selection_toggled
         self.setFrameShape(QFrame.Shape.StyledPanel)
         # Parsed once here rather than by every individual call site that needs it (previously
-        # _build_layout, the flagged-user dialog, and MainWindow._apply_filters each re-ran
-        # json.loads(doc_fields_json) + date parsing independently) -- cheap per row, but adds up
-        # when _apply_filters re-reads it for every row on every filter keystroke.
+        # _build_layout and the flagged-user dialog each re-ran json.loads(doc_fields_json) + date
+        # parsing independently) -- cheap per row, but adds up across many rows. Note
+        # MainWindow._recompute_filtered_scans (the history search/filter row) computes its own
+        # copy directly from each ScanRecord via _derive_display_fields rather than reading this
+        # cached one, since it has to run before a scan's row (and this cache) even exists -- see
+        # that method's own docstring.
         self.display_fields = _derive_display_fields(self.scan.doc_fields_json)
         self._previous_scans_cache = self._compute_previous_scans(all_scans)
         self._build_layout()
@@ -1289,8 +1306,56 @@ class _ClickAnywhereDateEdit(QDateEdit):
         popup.show()
 
 
-class _QualityOverlayLabel(QLabel):
-    """The document preview label, extended only to host the live blur/resolution quality-warning banner (see set_quality_overlay) -- kept as its own QLabel subclass (rather than a plain QLabel) purely so that banner can be positioned with explicit geometry inside the label's own frame rather than displacing it in the surrounding layout.
+class _FlashCapableLabel(QLabel):
+    """A live camera preview label that can briefly flash solid white -- see flash_white -- for
+    immediate on-screen feedback that a capture just happened, like a camera's own shutter flash.
+
+    A plain QLabel showing the live camera feed can't just have its own background/stylesheet
+    swapped to white for this: _update_previews calls setPixmap() on it every ~33ms (see
+    _PREVIEW_INTERVAL_MS), which would paint the live frame straight back over any such change on
+    the very next tick. Instead this adds a separate always-on-top child widget (_flash_overlay,
+    full white, otherwise hidden) that _update_previews never touches -- flash_white shows it at
+    full opacity and fades it back out via a QPropertyAnimation on its own QGraphicsOpacityEffect,
+    independent of the preview tick's own repainting.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._flash_overlay = QLabel(self)
+        self._flash_overlay.setStyleSheet("background-color: white;")
+        self._flash_overlay.setVisible(False)
+        self._flash_opacity_effect = QGraphicsOpacityEffect(self._flash_overlay)
+        self._flash_opacity_effect.setOpacity(1.0)
+        self._flash_overlay.setGraphicsEffect(self._flash_opacity_effect)
+        # Parented to self (the label) as well as kept as an attribute -- Qt parent-child ownership
+        # alone would be enough to keep this alive for the animation's duration, but the explicit
+        # attribute reference makes that non-obvious-at-a-glance guarantee visible in the code too.
+        self._flash_animation = QPropertyAnimation(self._flash_opacity_effect, b"opacity", self)
+        self._flash_animation.setDuration(_CAPTURE_FLASH_FADE_MS)
+        self._flash_animation.setStartValue(1.0)
+        self._flash_animation.setEndValue(0.0)
+        self._flash_animation.finished.connect(lambda: self._flash_overlay.setVisible(False))
+        self._position_flash_overlay()
+
+    def flash_white(self) -> None:
+        """Show this preview at solid white, immediately fading back to reveal the live feed underneath -- see class docstring."""
+        self._position_flash_overlay()
+        self._flash_overlay.raise_()  # on top of any other overlay this label hosts (e.g. the quality-warning banner)
+        self._flash_overlay.setVisible(True)
+        self._flash_animation.stop()
+        self._flash_opacity_effect.setOpacity(1.0)
+        self._flash_animation.start()
+
+    def _position_flash_overlay(self) -> None:
+        self._flash_overlay.setGeometry(0, 0, self.width(), self.height())
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_flash_overlay()
+
+
+class _QualityOverlayLabel(_FlashCapableLabel):
+    """The document preview label, extended to host both the live blur/resolution quality-warning banner (see set_quality_overlay) and the capture-flash overlay (see _FlashCapableLabel) -- kept as its own QLabel subclass (rather than a plain QLabel) purely so the banner can be positioned with explicit geometry inside the label's own frame rather than displacing it in the surrounding layout.
 
     No longer adds crop-selection support -- capture now saves immediately with no operator review/
     crop step (see MainWindow._run_capture_and_process); cropping moved to a post-hoc "Edit image…"
@@ -1363,6 +1428,17 @@ class MainWindow(QMainWindow):
         # sustained run of them does, so an occasional one-off missed frame doesn't flicker it.
         self._face_signal_lost_streak = 0
         self._doc_signal_lost_streak = 0
+        # Last-known (width, height) of each camera's own frame, in pixels -- kept even across a
+        # tick where a fresh frame didn't arrive (see _update_top_pane_height_cap, which uses these
+        # to cap how far down the splitter handle above the capture button can be dragged, so the
+        # previews can't be stretched past the point where the camera feed itself can no longer
+        # usefully grow to fill the extra height).
+        self._face_frame_size: tuple[int, int] | None = None
+        self._doc_frame_size: tuple[int, int] | None = None
+        # The cap most recently applied to self._top_pane_widget's maximum height -- cached purely
+        # so _update_top_pane_height_cap can skip the setMaximumHeight() call (and the layout
+        # invalidation it triggers) on the very frequent ticks where the cap hasn't actually changed.
+        self._top_pane_height_cap: int | None = None
         # See _warn_if_preview_tick_slow -- throttles how often a slow preview tick gets logged.
         self._slow_preview_tick_streak = 0
         # Backing state for the live document-camera blur warning (see
@@ -1394,10 +1470,33 @@ class MainWindow(QMainWindow):
         # since the fresh rows all start unchecked -- see that method).
         self._selected_scan_ids: set[int] = set()
 
+        # History list incremental-loading state -- see _load_history/_recompute_filtered_scans/
+        # _load_more_rows/_on_history_scrolled. self._all_scans is every saved scan, newest-first,
+        # refreshed on every full reload (_load_history) and incrementally on a fresh capture
+        # (_finish_save_capture); self._filtered_scans is that list narrowed by the current filter
+        # row controls (see _recompute_filtered_scans); self._loaded_count is how many of
+        # self._filtered_scans, counted from the front (newest), are currently built as
+        # HistoryRowWidgets -- growing self._history_page_size at a time as the operator scrolls
+        # near the bottom, rather than every matching scan being built as a widget up front (each
+        # row is a real per-image decode cost -- see HistoryRowWidget._build_thumbnail).
+        # self._history_page_size is re-read from settings on every full reload so a change made in
+        # Settings (General tab) takes effect immediately (see
+        # SettingsWindow._on_save_history_page_size_clicked's on_data_changed callback).
+        self._all_scans: list[ScanRecord] = []
+        self._filtered_scans: list[ScanRecord] = []
+        self._loaded_count: int = 0
+        self._history_page_size: int = get_history_page_size(self.conn)
+
         self.setWindowTitle("Kontroll")
         self._build_layout()
         self._load_history()
         self._restore_window_state()
+        # Scheduled for the very next event-loop iteration, after the window has actually been
+        # shown (main.py calls window.show() next, then app.exec()) -- see
+        # _nudge_layout_to_match_actual_geometry's own docstring for why this fixes a real reported
+        # startup glitch (the live camera previews rendering letterboxed/undersized within their own
+        # box until the operator nudged the window with a manual resize).
+        QTimer.singleShot(0, self._nudge_layout_to_match_actual_geometry)
 
         self.capture_shortcut = QShortcut(QKeySequence(get_capture_shortcut(self.conn)), self)
         self.capture_shortcut.activated.connect(self._on_capture_and_process_clicked)
@@ -1432,7 +1531,7 @@ class MainWindow(QMainWindow):
         top_layout.setContentsMargins(0, 0, 0, 0)
 
         previews_row = QHBoxLayout()
-        self.face_preview_label = self._build_preview_label()
+        self.face_preview_label = self._build_preview_label(_FlashCapableLabel)
         self.doc_preview_label = self._build_preview_label(_QualityOverlayLabel)
         self.doc_quality_warning_label = self._build_quality_warning_label()
         self.doc_preview_label.set_quality_overlay(self.doc_quality_warning_label)
@@ -1457,8 +1556,19 @@ class MainWindow(QMainWindow):
         bottom_widget = QWidget()
         bottom_layout = QVBoxLayout(bottom_widget)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
-        bottom_layout.addWidget(QLabel("Previous scans (newest first):"))
-        bottom_layout.addLayout(self._build_filter_row())
+
+        # Hidden by default to keep the history list itself as roomy as possible -- toggled by the
+        # "Search" button down by Settings in the status bar (see _build_status_bar/
+        # _on_search_toggle_clicked). A QWidget wrapper is what makes the whole row hide/show as one
+        # unit -- a bare QHBoxLayout (what _build_filter_row returns) has no setVisible of its own.
+        self.filter_row_widget = QWidget()
+        self.filter_row_widget.setLayout(self._build_filter_row())
+        self.filter_row_widget.setVisible(False)
+        bottom_layout.addWidget(self.filter_row_widget)
+
+        self.history_status_label = QLabel()
+        self.history_status_label.setStyleSheet("color: gray;")
+        bottom_layout.addWidget(self.history_status_label)
 
         self._history_rows: list[HistoryRowWidget] = []
 
@@ -1475,6 +1585,9 @@ class MainWindow(QMainWindow):
         self.history_layout = QVBoxLayout(self.history_container)
         self.history_layout.addStretch(1)  # keeps rows top-aligned as they're inserted above this
         self.history_scroll_area.setWidget(self.history_container)
+        # Loads the next chunk of scans as the operator scrolls near the bottom -- see
+        # _on_history_scrolled/_load_more_rows.
+        self.history_scroll_area.verticalScrollBar().valueChanged.connect(self._on_history_scrolled)
         bottom_layout.addWidget(self.history_scroll_area, stretch=1)  # fills the bottom pane's space and grows/shrinks with it
 
         self.top_bottom_splitter.addWidget(top_widget)
@@ -1489,7 +1602,7 @@ class MainWindow(QMainWindow):
         self._build_status_bar()
 
     def _build_status_bar(self) -> None:
-        """Build the window's status bar: scan-count/disk-usage stats on the left, a Settings button on the right."""
+        """Build the window's status bar: scan-count/disk-usage stats on the left, a Search toggle and a Settings button on the right."""
         # QStatusBar draws a sunken-border frame around every widget added via addWidget/
         # addPermanentWidget by default, which shows up as a vertical divider line next to each
         # one -- this app doesn't want those dividers, so they're switched off here.
@@ -1498,12 +1611,25 @@ class MainWindow(QMainWindow):
         self.status_stats_label = QLabel()
         self.statusBar().addWidget(self.status_stats_label)
 
+        # Checkable so its own pressed/sunken look doubles as the "search panel is open" indicator,
+        # with no extra state to keep in sync -- see _on_search_toggle_clicked/filter_row_widget.
+        self.search_toggle_button = QPushButton("Search")
+        self.search_toggle_button.setCheckable(True)
+        self.search_toggle_button.toggled.connect(self._on_search_toggle_clicked)
+        self.statusBar().addPermanentWidget(self.search_toggle_button)
+
         settings_button = QPushButton("Settings")
         settings_button.clicked.connect(self._on_settings_clicked)
         self.statusBar().addPermanentWidget(settings_button)
 
         self._recompute_storage_bytes()
         self._refresh_status_bar_stats()
+
+    def _on_search_toggle_clicked(self, checked: bool) -> None:
+        """Show or hide the history search/filter row -- see filter_row_widget, hidden by default so it doesn't take up space until the operator actually wants it."""
+        self.filter_row_widget.setVisible(checked)
+        if checked:
+            self.search_edit.setFocus()
 
     def _recompute_storage_bytes(self) -> None:
         """Walk the faces/documents directories to get the real on-disk total, and cache it.
@@ -1584,18 +1710,13 @@ class MainWindow(QMainWindow):
         self._refresh_status_bar_stats()
 
     def _reload_history(self) -> None:
-        """Discard every currently-displayed history row and reload the full list fresh from the database.
+        """Discard every currently-displayed history row and reload the full list fresh from the database (see _load_history, which rebuilds from the front).
 
-        Also clears the batch-export selection: the fresh HistoryRowWidgets start with their
-        checkboxes unchecked, so a selection referring to the old (now-discarded) widgets would
-        otherwise silently disagree with what's actually shown as selected on screen.
+        Also clears the batch-export selection: a purge/delete/re-analyze can change or remove
+        exactly the rows a selection refers to, so starting fresh (every checkbox unchecked) is
+        safer than trying to carry a possibly-stale selection across a full reload.
         """
-        for row in self._history_rows:
-            row.setParent(None)
-            row.deleteLater()
-        self._history_rows.clear()
         self._selected_scan_ids.clear()
-        self._update_export_selected_button()
         self._load_history()
 
     def _on_capture_shortcut_changed(self, sequence_text: str) -> None:
@@ -1622,7 +1743,7 @@ class MainWindow(QMainWindow):
         self.date_filter_edit.setCalendarWidget(
             ResultAwareCalendarWidget(self._scan_result_dates, on_shown=self._on_date_calendar_shown)
         )
-        self.date_filter_edit.dateChanged.connect(self._apply_filters)
+        self.date_filter_edit.dateChanged.connect(self._on_filters_changed)
         self._date_filter_opacity_effect = QGraphicsOpacityEffect(self.date_filter_edit)
         self.date_filter_edit.setGraphicsEffect(self._date_filter_opacity_effect)
         self._update_date_filter_dim_state()
@@ -1631,12 +1752,12 @@ class MainWindow(QMainWindow):
         filter_row.addWidget(QLabel("Result:"))
         self.match_filter_combo = QComboBox()
         self.match_filter_combo.addItems(["All", "Match", "No Match"])
-        self.match_filter_combo.currentTextChanged.connect(self._apply_filters)
+        self.match_filter_combo.currentTextChanged.connect(self._on_filters_changed)
         filter_row.addWidget(self.match_filter_combo)
 
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Search name...")
-        self.search_edit.textChanged.connect(self._apply_filters)
+        self.search_edit.textChanged.connect(self._on_filters_changed)
         filter_row.addWidget(self.search_edit, stretch=1)
 
         clear_filters_button = QPushButton("Clear filters")
@@ -1654,7 +1775,7 @@ class MainWindow(QMainWindow):
     def _on_date_filter_checkbox_toggled(self, checked: bool) -> None:
         """Dim the date picker to match whether the 'any date' checkbox is checked, then re-apply filters."""
         self._update_date_filter_dim_state()
-        self._apply_filters()
+        self._on_filters_changed()
 
     def _update_date_filter_dim_state(self) -> None:
         """Set the date picker's opacity to reflect whether it's currently in effect (unchecked) or not (checked)."""
@@ -1671,37 +1792,106 @@ class MainWindow(QMainWindow):
         self.date_filter_edit.setDate(QDate.currentDate())
         self.match_filter_combo.setCurrentText("All")
         self.search_edit.clear()
-        self._apply_filters()
+        self._on_filters_changed()
 
-    def _apply_filters(self) -> None:
-        """Show or hide each history row so only scans matching the current date/result/search filters remain visible."""
+    def _on_filters_changed(self) -> None:
+        """A filter control changed -- recompute the filtered scan list and reload the history list from its front (whatever was previously loaded/scrolled-to is meaningless against a new filter)."""
+        self._recompute_filtered_scans()
+        self._reset_loaded_rows()
+
+    def _recompute_filtered_scans(self) -> None:
+        """Recompute self._filtered_scans from self._all_scans using the current filter controls' state.
+
+        Pure computation over already-fetched records, no DB query and no widget rendering (see
+        _reset_loaded_rows/_load_more_rows for that) -- this is what lets a filter/search reach
+        every saved scan, not just whichever ones happen to be loaded so far.
+        """
         match_filter = self.match_filter_combo.currentText()
         search_text = self.search_edit.text().strip().lower()
         date_filter_active = not self.date_filter_checkbox.isChecked()
         selected_date = self.date_filter_edit.date().toPyDate()
 
-        for row in self._history_rows:
-            scan = row.scan
-            visible = True
-
-            if date_filter_active:
-                visible = visible and datetime.fromisoformat(scan.created_at).date() == selected_date
-
-            if match_filter == "Match":
-                visible = visible and scan.match_result in ("match", "override_match")
-            elif match_filter == "No Match":
-                visible = visible and scan.match_result in ("no_match", "override_no_match")
-
+        filtered: list[ScanRecord] = []
+        for scan in self._all_scans:
+            if date_filter_active and datetime.fromisoformat(scan.created_at).date() != selected_date:
+                continue
+            if match_filter == "Match" and scan.match_result not in ("match", "override_match"):
+                continue
+            if match_filter == "No Match" and scan.match_result not in ("no_match", "override_no_match"):
+                continue
             if search_text:
-                display_fields = row.display_fields
+                display_fields = _derive_display_fields(scan.doc_fields_json)
                 haystack = f"{display_fields.first_name} {display_fields.last_name}".lower()
-                visible = visible and search_text in haystack
+                if search_text not in haystack:
+                    continue
+            filtered.append(scan)
+        self._filtered_scans = filtered
 
-            row.setVisible(visible)
+    def _reset_loaded_rows(self) -> None:
+        """Tear down every currently-built history row and reload from the front of self._filtered_scans -- used on a full reload and whenever the filter controls change."""
+        for row in self._history_rows:
+            row.setParent(None)
+            row.deleteLater()
+        self._history_rows.clear()
+        self._loaded_count = 0
+        self._load_more_rows()
+        self._fill_viewport_with_rows()
+
+    def _load_more_rows(self) -> None:
+        """Build and append the next chunk (self._history_page_size scans) of self._filtered_scans below whatever's already loaded.
+
+        Called once for the initial load, again whenever the operator scrolls near the bottom (see
+        _on_history_scrolled), and again by _fill_viewport_with_rows if the loaded rows don't yet
+        fill the visible viewport. A no-op once every filtered scan is already loaded.
+        """
+        if self._loaded_count >= len(self._filtered_scans):
+            return
+        next_chunk = self._filtered_scans[self._loaded_count : self._loaded_count + self._history_page_size]
+        for scan in next_chunk:
+            self._append_history_row(scan, all_scans=self._all_scans)
+        self._loaded_count += len(next_chunk)
+        self._update_history_status_label()
+
+    def _fill_viewport_with_rows(self) -> None:
+        """Keep loading additional chunks until either every filtered scan is loaded or the loaded rows already overflow the visible viewport (i.e. a scrollbar actually exists).
+
+        Without this, a tall window/screen could end up showing fewer rows than actually fit on
+        screen with no way to trigger loading more: _on_history_scrolled only ever fires once
+        there's something to scroll, which never happens if the loaded content doesn't yet exceed
+        the viewport height in the first place. guard is just a sane upper bound in case a screen
+        somehow never reports a scrollable range -- avoids ever looping forever.
+        """
+        guard = 0
+        while (
+            self._loaded_count < len(self._filtered_scans)
+            and self.history_scroll_area.verticalScrollBar().maximum() == 0
+            and guard < 50
+        ):
+            self._load_more_rows()
+            guard += 1
+
+    def _on_history_scrolled(self, value: int) -> None:
+        """Load the next chunk once the operator has scrolled near the bottom of the currently-loaded rows -- see _load_more_rows."""
+        scrollbar = self.history_scroll_area.verticalScrollBar()
+        if value >= scrollbar.maximum() - _HISTORY_SCROLL_LOAD_MORE_THRESHOLD_PX:
+            self._load_more_rows()
+
+    def _update_history_status_label(self) -> None:
+        """Refresh the small status line below the filter row showing how much of the filtered scan list is currently loaded."""
+        total = len(self._filtered_scans)
+        if self._loaded_count >= total:
+            self.history_status_label.setText(f"Showing all {total} scan(s)")
+        else:
+            self.history_status_label.setText(f"Showing {self._loaded_count} of {total} scan(s) -- scroll down for more")
 
     def _scan_result_dates(self) -> set[date]:
-        """Return the distinct calendar dates that have at least one saved scan, for ResultAwareCalendarWidget to highlight."""
-        return {datetime.fromisoformat(row.scan.created_at).date() for row in self._history_rows}
+        """Return the distinct calendar dates that have at least one saved scan, for ResultAwareCalendarWidget to highlight.
+
+        Reads self._all_scans (every saved scan) rather than self._history_rows (only the rows
+        currently loaded/built) -- otherwise the calendar would only ever highlight dates among
+        whatever's been scrolled into view so far.
+        """
+        return {datetime.fromisoformat(scan.created_at).date() for scan in self._all_scans}
 
     def _measure_history_list_size(self, visible_rows: int) -> QSize:
         """Measure a representative history row to pick a scan-list size showing exactly `visible_rows` rows.
@@ -1725,14 +1915,15 @@ class MainWindow(QMainWindow):
         width = int(row_size.width() * 1.15) + scrollbar_extent
         return QSize(width, row_size.height() * visible_rows)
 
-    def _build_preview_label(self, label_class: type[QLabel] = QLabel) -> QLabel:
+    def _build_preview_label(self, label_class: type[QLabel] = _FlashCapableLabel) -> QLabel:
         """Build one live preview label that expands to fill whatever space its pane currently has.
 
         A minimum size (rather than a fixed one) keeps it from collapsing to nothing when the
         splitter handle above is dragged small, while still letting it grow -- _update_previews
         rescales each incoming frame to the label's current size on every tick. label_class lets
-        the document preview use _QualityOverlayLabel (adding the live quality-warning banner) while
-        the face preview stays a plain QLabel, without duplicating this setup.
+        the document preview use _QualityOverlayLabel (adding the live quality-warning banner on
+        top of the capture-flash overlay both preview labels get from _FlashCapableLabel) while the
+        face preview only needs the plain flash-capable base, without duplicating either setup.
         """
         label = label_class("No camera signal")
         label.setMinimumSize(*_PREVIEW_SIZE)
@@ -1775,22 +1966,24 @@ class MainWindow(QMainWindow):
         return label
 
     def _load_history(self) -> None:
-        """Populate the history list with every previously saved scan, newest first.
+        """Fetch every saved scan from the database and (re)build the history list from its first chunk, ready to load more as the operator scrolls -- see _load_more_rows/_on_history_scrolled.
 
-        _add_history_row always inserts at the top, so the scans are fed in here oldest-first
-        (the reverse of list_scans' own newest-first order) -- each insert-at-top then pushes
-        the previous one down by exactly one, leaving the newest scan on top once the loop ends.
+        Fetches the full scan list once up front (self._all_scans) and hands it to every row,
+        rather than letting each displayed row independently run its own full-table query to find
+        its own previous visits (HistoryRowWidget._compute_previous_scans) -- that used to make
+        every history load do O(n) redundant full-table scans for n displayed rows. The same
+        self._all_scans also backs the filter row (_recompute_filtered_scans) and the calendar's
+        scan-date highlighting (_scan_result_dates), so only rows for whatever's actually been
+        loaded/scrolled-to are ever built as widgets -- see _reset_loaded_rows for why that matters
+        (HistoryRowWidget construction is a real per-image decode cost, not a cheap layout op).
 
-        Fetches the full scan list once up front (all_scans) and hands it to every row, rather
-        than letting each of the up-to-100 displayed rows independently run its own full-table
-        query to find its own previous visits (HistoryRowWidget._compute_previous_scans) -- that
-        used to make every history load do O(n) redundant full-table scans for n displayed rows.
+        Also re-reads the load-batch size from settings, so a change made in Settings (General tab)
+        takes effect on the next reload without needing a restart.
         """
-        all_scans = list_scans(self.conn, limit=100_000)
-        displayed_scans = list_scans(self.conn)
-        for scan in reversed(displayed_scans):
-            self._add_history_row(scan, all_scans=all_scans)
-        self._apply_filters()
+        self._all_scans = list_scans(self.conn, limit=100_000)
+        self._history_page_size = get_history_page_size(self.conn)
+        self._recompute_filtered_scans()
+        self._reset_loaded_rows()
 
     def _build_history_row(self, scan: ScanRecord, all_scans: list[ScanRecord] | None) -> HistoryRowWidget:
         """Construct one HistoryRowWidget with every standard callback wired up -- shared by _add_history_row (a brand new row) and _replace_history_row (rebuilding an existing row in place), so the two can never drift apart in which callbacks they pass."""
@@ -1808,39 +2001,50 @@ class MainWindow(QMainWindow):
         )
 
     def _add_history_row(self, scan: ScanRecord, all_scans: list[ScanRecord] | None = None) -> None:
-        """Insert one scan as the top-most row of the history list.
+        """Insert one scan as the new top-most row of the history list -- used only for a brand new capture (see _finish_save_capture), which is always the newest scan on record and so always belongs above every currently-loaded row. Loading a chunk of older scans (initial load, scroll-triggered, or filling the viewport) goes through _append_history_row instead, which adds below whatever's already loaded rather than above it.
 
-        all_scans, if the caller already has the full scan list in hand (e.g. _load_history
-        loading many rows at once), is forwarded to HistoryRowWidget to avoid a redundant query --
-        see its docstring. Omitted when adding a single new row (e.g. after a fresh capture),
-        where one query is just a normal one-off cost, not a hot loop.
+        all_scans, if the caller already has the full scan list in hand, is forwarded to
+        HistoryRowWidget to avoid a redundant query -- see its docstring.
         """
         row = self._build_history_row(scan, all_scans)
         self.history_layout.insertWidget(0, row)
         self._history_rows.append(row)
 
-    def _refresh_same_person_rows(self, new_scan: ScanRecord, all_scans: list[ScanRecord]) -> None:
-        """After new_scan is added, rebuild in place every *other* already-displayed row that represents the same person, so their visit-count badge/previous-visits list picks up this new visit too.
+    def _append_history_row(self, scan: ScanRecord, all_scans: list[ScanRecord] | None = None) -> None:
+        """Build one HistoryRowWidget and add it below every currently-loaded row (just above the trailing layout stretch, see _build_layout's `history_layout.addStretch(1)`) -- see _load_more_rows, which always feeds scans in newest-first order, so appending them in that same order naturally keeps the on-screen list newest-to-oldest top-to-bottom without needing to reverse anything.
 
-        Without this, a person's earlier row(s) keep showing whatever visit count was true at the
+        Restores this row's export-selection checkbox if the scan is already part of the batch-
+        export selection (self._selected_scan_ids), so scrolling to load more rows never visually
+        loses a selection made earlier -- see _on_history_row_selection_toggled.
+        """
+        row = self._build_history_row(scan, all_scans)
+        self.history_layout.insertWidget(self.history_layout.count() - 1, row)
+        self._history_rows.append(row)
+        if scan.id in self._selected_scan_ids:
+            row.export_selection_checkbox.setChecked(True)
+
+    def _refresh_same_person_rows(self, reference_scan: ScanRecord, all_scans: list[ScanRecord]) -> None:
+        """Rebuild in place every *other* already-displayed row that represents the same person as reference_scan, so their visit-count badge/previous-visits list picks up whatever changed -- a new visit added (reference_scan is the just-added scan, still present in all_scans) or one removed (reference_scan is the just-deleted scan, already absent from all_scans -- see _on_history_row_deleted).
+
+        Without this, a person's other row(s) keep showing whatever visit count was true at the
         moment they were originally built -- e.g. their very first visit's row never gained a
         "Visit 1 of N" badge at all (built with no prior visits on record, so
         HistoryRowWidget._build_layout never added the badge in the first place -- see its
         `if self._previous_scans_cache:` guard) even after a repeat visit made one of these,
         because that first row is never touched again by the single-row insert _add_history_row
         does for an ordinary capture. Deliberately targeted (only this person's rows, rebuilt in
-        place) rather than a full _reload_history() -- unlike a delete or re-analyze (which already
-        do reload everything, see _on_history_row_deleted/_finish_reanalyze), this runs on every
-        single capture, the app's most frequent action, where rebuilding the entire list each time
-        would cost far more than the handful of rows an ordinary repeat visit actually touches.
+        place) rather than a full _reload_history(), which would tear down and rebuild the whole
+        list and reset the scroll position -- this runs on every single capture and delete, common
+        actions where doing that would cost far more (and be far more disruptive) than the handful
+        of rows either one actually touches.
         """
-        if not new_scan.doc_fields_json:
+        if not reference_scan.doc_fields_json:
             return
-        doc_fields = json.loads(new_scan.doc_fields_json)
+        doc_fields = json.loads(reference_scan.doc_fields_json)
         if not doc_fields:
             return
         same_person_scans = find_previous_scans(
-            doc_fields, [row.scan for row in self._history_rows], exclude_scan_id=new_scan.id
+            doc_fields, [row.scan for row in self._history_rows], exclude_scan_id=reference_scan.id
         )
         if not same_person_scans:
             return
@@ -1873,8 +2077,16 @@ class MainWindow(QMainWindow):
         self.export_selected_button.setEnabled(count > 0)
 
     def _on_export_selected_clicked(self) -> None:
-        """Batch-export every scan the operator checked via its row checkbox, newest first, as one combined report -- see _export_scans."""
-        selected_scans = [row.scan for row in self._history_rows if row.scan.id in self._selected_scan_ids]
+        """Batch-export every scan the operator checked via its row checkbox, newest first, as one combined report -- see _export_scans.
+
+        Resolved from self._all_scans by id rather than by filtering self._history_rows: a
+        selection can outlive the row that was checked (e.g. a filter change reloads the list from
+        its front without clearing the selection -- see _on_filters_changed/_reset_loaded_rows), so
+        only whatever's currently loaded/built as a widget would no longer be enough to recover
+        every selected scan.
+        """
+        scans_by_id = {scan.id: scan for scan in self._all_scans}
+        selected_scans = [scans_by_id[scan_id] for scan_id in self._selected_scan_ids if scan_id in scans_by_id]
         selected_scans.sort(key=lambda scan: scan.created_at, reverse=True)
         self._export_scans(selected_scans)
 
@@ -2052,10 +2264,18 @@ class MainWindow(QMainWindow):
         date) is what makes this an unambiguous, always-works jump straight to that one scan,
         rather than a filter that could still leave several same-day visits for the operator to
         pick back out by hand, or leave the target hidden if an unrelated match-result/search
-        filter was active. The row is then scrolled into view, its detail section expanded, and
-        briefly outlined so it's obvious which one the operator landed on.
+        filter was active. Also loads however many more chunks are needed to actually reach the
+        target scan (it's frequently not among whatever was already loaded, once history grows
+        past one load-batch's worth of scans -- see _load_more_rows). The row is then scrolled into
+        view, its detail section expanded, and briefly outlined so it's obvious which one the
+        operator landed on.
         """
         self._on_clear_filters_clicked()
+        target_index = next((i for i, scan in enumerate(self._filtered_scans) if scan.id == scan_id), None)
+        if target_index is None:
+            return
+        while self._loaded_count <= target_index and self._loaded_count < len(self._filtered_scans):
+            self._load_more_rows()
         target_row = next((row for row in self._history_rows if row.scan.id == scan_id), None)
         if target_row is None:
             return
@@ -2077,8 +2297,28 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(2000, _restore)
 
     def _on_history_row_deleted(self, row: HistoryRowWidget, freed_bytes: int) -> None:
-        """Reload the whole history list after a scan is deleted (DB row + image files already gone by this point), so every other row belonging to the same person recomputes its visit-count badge and previous-visits list (see document/person_matcher.py) without the deleted scan, not just this one's own row disappearing."""
-        self._reload_history()
+        """Remove just this one scan from the history list's own bookkeeping (DB row + image files already gone by this point) -- deliberately not a full _reload_history().
+
+        A full reload tore down and rebuilt every row from the front, which reset the scroll
+        position back up near the top of a now-much-shorter list -- a real reported annoyance when
+        deleting a scan while scrolled partway down. HistoryRowWidget._on_delete_clicked already
+        tears down the deleted row's own widget immediately after this callback returns, so this
+        only needs to drop it from self._all_scans/_filtered_scans/_history_rows/_loaded_count
+        (and self._selected_scan_ids, in case it happened to be checked) so it doesn't linger as a
+        stale reference -- and to refresh every other already-displayed row for the same person
+        (see _refresh_same_person_rows, also used for a fresh capture) so their visit-count badge/
+        previous-visits list drops the deleted scan too, without touching anything else on screen.
+        """
+        deleted_scan = row.scan
+        self._all_scans = [scan for scan in self._all_scans if scan.id != deleted_scan.id]
+        self._filtered_scans = [scan for scan in self._filtered_scans if scan.id != deleted_scan.id]
+        if row in self._history_rows:
+            self._history_rows.remove(row)
+            self._loaded_count = max(0, self._loaded_count - 1)
+        self._selected_scan_ids.discard(deleted_scan.id)
+        self._refresh_same_person_rows(deleted_scan, self._all_scans)
+        self._update_history_status_label()
+        self._update_export_selected_button()
         self._add_to_cached_storage_bytes(-freed_bytes)
         self._refresh_status_bar_stats()
 
@@ -2121,7 +2361,77 @@ class MainWindow(QMainWindow):
         if self._settings_window is not None:
             self._settings_window.update_camera_diagnostics(face_frame, doc_frame)
 
+        self._update_top_pane_height_cap(face_frame, doc_frame)
         self._warn_if_preview_tick_slow(time.monotonic() - tick_started_at)
+
+    def _update_top_pane_height_cap(self, face_frame: np.ndarray | None, doc_frame: np.ndarray | None) -> None:
+        """Cap how far down the splitter handle above the capture button can be dragged, so the operator can't stretch the previews taller than the point where the camera feed itself can still usefully grow to fill the extra height.
+
+        _set_preview_pixmap scales each frame to fit its label's box preserving aspect ratio
+        (Qt.AspectRatioMode.KeepAspectRatio) -- once the box's height exceeds what the frame's own
+        aspect ratio needs for the box's current width, every bit of extra height beyond that just
+        becomes blank gray padding above/below the picture (the same letterboxing an operator
+        screenshot showed at startup, see _nudge_layout_to_match_actual_geometry), not a bigger
+        picture. Capping self._top_pane_widget's maximumHeight at that point is what stops the
+        splitter handle drag from ever reaching that dead zone in the first place -- QSplitter
+        already respects a managed widget's maximumHeight when the operator drags a handle, so
+        nothing else is needed to actually enforce this.
+
+        Recomputed on every preview tick (cheap: arithmetic plus one setMaximumHeight() call,
+        skipped entirely when the computed cap hasn't actually changed) so it always reflects the
+        *current* camera resolution and window width -- both of which can change live (an operator
+        picking a different resolution in Settings, or simply resizing the window). Falls back to
+        the last frame size seen from each camera on a tick where a fresh one didn't arrive (a
+        single dropped/offline tick shouldn't suddenly lift or tighten the cap), and leaves it
+        unrestricted entirely until at least one real frame has been seen from *both* cameras --
+        nothing to compute either one's aspect ratio from before that.
+        """
+        if face_frame is not None:
+            self._face_frame_size = (face_frame.shape[1], face_frame.shape[0])  # (width, height)
+        if doc_frame is not None:
+            self._doc_frame_size = (doc_frame.shape[1], doc_frame.shape[0])
+        if self._face_frame_size is None or self._doc_frame_size is None:
+            return
+
+        # For each preview: given its current on-screen width (fixed by the window's own width,
+        # unaffected by the vertical splitter handle -- previews_row splits width evenly, only
+        # height is what the handle controls) and its camera's native aspect ratio, how tall could
+        # this preview usefully get before any more height stops growing the picture -- translated
+        # into the equivalent cap on self._top_pane_widget's own total height, by adding back
+        # whatever fixed overhead (headline label, capture button row, margins) isn't the preview
+        # itself. That overhead is architecturally constant regardless of the current splitter
+        # position, so measuring it from the *current* live geometry here is always accurate, not
+        # just at the moment this happens to run.
+        candidate_caps = []
+        for preview_label, (frame_width, frame_height) in (
+            (self.face_preview_label, self._face_frame_size),
+            (self.doc_preview_label, self._doc_frame_size),
+        ):
+            label_width = preview_label.width()
+            if label_width <= 0 or frame_width <= 0:
+                continue
+            max_useful_preview_height = round(label_width * frame_height / frame_width)
+            overhead = self._top_pane_widget.height() - preview_label.height()
+            candidate_caps.append(overhead + max_useful_preview_height)
+        if not candidate_caps:
+            return
+
+        # The more restrictive (smaller) of the two previews' caps -- past that point at least one
+        # of them would already be showing gray padding, even if the other could still grow a bit
+        # more. Floored at the pane's own minimumSizeHint so this can never shrink it below what
+        # it's structurally allowed to be.
+        cap = max(min(candidate_caps), self._top_pane_widget.minimumSizeHint().height())
+        # The setMaximumHeight() call itself is skipped when the cap hasn't actually changed (cheap
+        # but pointless to repeat every tick), but the clamp-check below always runs regardless --
+        # self._top_pane_height could need pulling down to a still-unchanged cap for a reason other
+        # than the cap itself just having moved, e.g. a value restored from a previous session that
+        # was saved back when the camera was configured at a larger/differently-shaped resolution.
+        if cap != self._top_pane_height_cap:
+            self._top_pane_height_cap = cap
+            self._top_pane_widget.setMaximumHeight(cap)
+        if self._top_pane_height is not None and self._top_pane_height > cap:
+            self._top_pane_height = cap
+            self._sync_splitter_pane_heights()
 
     def _warn_if_preview_tick_slow(self, elapsed_seconds: float) -> None:
         """Log (throttled) when one full preview tick -- both camera reads plus both pixmap conversions -- takes long enough to be a user-visible stutter, since this whole method runs on the main GUI thread's timer and blocks everything else (button clicks, redraws) for its duration.
@@ -2289,6 +2599,7 @@ class MainWindow(QMainWindow):
         self._pending_face_frame = None
         self._pending_doc_frame = None
         self.discard_pending_button.setVisible(False)
+        self._flash_capture_previews()
 
         self.capture_button.setText("Processing…")
         self._start_capture_analysis(
@@ -2297,6 +2608,11 @@ class MainWindow(QMainWindow):
             on_finished=lambda analysis: self._finish_save_capture(analysis, face_frame, doc_frame),
             on_failed=self._on_save_capture_failed,
         )
+
+    def _flash_capture_previews(self) -> None:
+        """Briefly flash both live preview panes white -- an immediate, camera-shutter-style visual cue that a capture just happened, fired the moment a still frame was actually grabbed from both cameras (not merely on the button click, which can still be waiting on one camera -- see the frame-still-missing branch above this call site). Purely cosmetic: runs synchronously and returns immediately, well before the background analysis pipeline (which can take several seconds) finishes."""
+        self.face_preview_label.flash_white()
+        self.doc_preview_label.flash_white()
 
     def _start_capture_analysis(
         self,
@@ -2418,10 +2734,19 @@ class MainWindow(QMainWindow):
             )
 
             new_scan = get_scan_by_id(self.conn, scan_id)
-            all_scans = list_scans(self.conn, limit=100_000)
-            self._add_history_row(new_scan, all_scans=all_scans)
-            self._refresh_same_person_rows(new_scan, all_scans)
-            self._apply_filters()
+            self._all_scans.insert(0, new_scan)  # newest-first, matches list_scans' own order
+            self._recompute_filtered_scans()
+            # A fresh capture is always the newest scan on record, so if it matches the current
+            # filters it always belongs directly above every currently-loaded row -- insert it there
+            # (cheap: one new row) rather than reloading the whole list, since this runs on every
+            # single capture, the app's most frequent action. If it doesn't match the current
+            # filters (e.g. an active search for a different name), self._filtered_scans is
+            # unchanged and nothing here needs to touch the widget tree at all.
+            if self._filtered_scans and self._filtered_scans[0].id == new_scan.id:
+                self._add_history_row(new_scan, all_scans=self._all_scans)
+                self._loaded_count += 1
+                self._refresh_same_person_rows(new_scan, self._all_scans)
+                self._update_history_status_label()
             self._refresh_status_bar_stats()
             self.statusBar().showMessage(f"✓ Scan #{scan_id} saved", 4000)
 
@@ -2532,6 +2857,16 @@ class MainWindow(QMainWindow):
         handle -- _on_splitter_moved keeps self._top_pane_height in sync with that.
         """
         super().resizeEvent(event)
+        self._sync_splitter_pane_heights()
+
+    def _sync_splitter_pane_heights(self) -> None:
+        """Apply self._top_pane_height (or, the first time, a freshly learned one) to the splitter -- the actual work behind resizeEvent, pulled out into its own method purely for readability.
+
+        Learning self._top_pane_height here (from self._top_pane_widget.sizeHint(), when nothing's
+        been learned or restored yet) only happens once -- every later call just reapplies whatever
+        value is already cached, never recomputing it, which is normally exactly right (a resize
+        shouldn't change the pinned top-pane height).
+        """
         splitter = getattr(self, "top_bottom_splitter", None)
         if splitter is None:
             return
@@ -2539,6 +2874,41 @@ class MainWindow(QMainWindow):
             self._top_pane_height = self._top_pane_widget.sizeHint().height()
         bottom_height = max(splitter.height() - splitter.handleWidth() - self._top_pane_height, 0)
         splitter.setSizes([self._top_pane_height, bottom_height])
+
+    def _nudge_layout_to_match_actual_geometry(self) -> None:
+        """Force Qt to fully redo this window's entire layout once it has actually been shown -- fixes a real reported bug where the live camera previews render letterboxed (a smaller-than-their-actual-box image, with gray padding around it) at startup, until the operator manually resizes the window, at which point the previews properly grow to fill their box.
+
+        Diagnosed from an operator screenshot: the splitter's own top/bottom pane split, the
+        headline labels, the capture button, and the history list below were all already exactly
+        where they should be *before* any manual resize -- only the previews themselves were
+        undersized within an already-correctly-sized box, which rules out the splitter's own
+        top-pane height as the cause (a first attempt at this fix targeted that instead, gated to
+        only run once on a fresh install with nothing saved yet -- confirmed, from the same
+        screenshot, to *not* actually be the problem, since it reproduced on a returning operator's
+        window with previously-saved geometry too).
+
+        _set_preview_pixmap re-queries each preview label's own .size() fresh on every ~30fps tick
+        (see _PREVIEW_INTERVAL_MS) to decide how large a frame to scale into it -- so the previews
+        coming out undersized despite that means the label's own .size() was itself reporting a
+        smaller box than what it's actually rendered at. This is a known category of Qt/PyQt6 quirk:
+        a QSizePolicy.Expanding child nested inside a QSplitter can end up reporting a stale,
+        smaller geometry than its true final layout allocation until something forces a real,
+        whole-window resize/layout pass -- merely recomputing and re-applying a splitter pane size
+        (this method's first version) observably wasn't enough to trigger that on its own.
+
+        The fix is to reproduce a real manual resize programmatically: grow the window by a single
+        pixel and immediately shrink it back. Each of those is a genuine QResizeEvent -- what
+        actually forces Qt to redo geometry for every descendant widget, previews included -- and
+        resizeEvent()/_sync_splitter_pane_heights() already runs as a normal side effect of that,
+        so the splitter's own pane split stays correctly in sync too. The 1px growth/shrink is
+        imperceptible on screen and the window ends up at exactly its original size. Scheduled via
+        QTimer.singleShot(0, ...) at the end of __init__, so this runs on the very next event-loop
+        iteration after main.py's window.show() call -- by which point the window is actually on
+        screen, which a same-tick resize (tried first) can't rely on.
+        """
+        current_size = self.size()
+        self.resize(current_size.width() + 1, current_size.height())
+        self.resize(current_size)
 
     def _restore_window_state(self) -> None:
         """Restore the window's size/position and the splitter's pane split from the last session, if anything was saved.

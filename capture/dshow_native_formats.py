@@ -71,3 +71,32 @@ def list_native_formats(device_index: int) -> list[NativeFormat]:
         NativeFormat(index=raw["index"], fourcc=raw["media_type_str"], width=raw["width"], height=raw["height"])
         for raw in raw_formats
     ]
+
+
+def list_video_input_device_names() -> list[str]:
+    """Return the display name of every DirectShow-registered video input device, in the same
+    index order `cv2.VideoCapture(index, cv2.CAP_DSHOW)` uses.
+
+    This is a query against the OS's own device registry (DirectShow's SystemDeviceEnum), not a
+    per-device open/read -- it doesn't touch any camera hardware at all, so it's near-instant even
+    with several devices attached, unlike `capture/camera_manager.py`'s own `enumerate_cameras`/
+    `prerequisites.py::check_cameras`, which previously had no way to know how many devices exist
+    up front and so blindly opened+read indices 0..9 in turn (a real multi-second-per-index
+    hardware round trip each, diagnosed as the main cause of "camera detection freezes the app").
+    Callers use this to know exactly which indices are worth opening at all, and to label a
+    discovered camera with its real name instead of a generic "Camera N".
+
+    Returns an empty list (never raises) if enumeration itself fails -- e.g. pygrabber/comtypes
+    unavailable, or a COM error on this thread -- so callers fall back to their previous blind
+    index-probing loop rather than losing camera detection entirely.
+    """
+    try:
+        from pygrabber.dshow_graph import FilterGraph
+
+        return FilterGraph().get_input_devices()
+    except Exception:
+        logger.warning(
+            "Failed to enumerate DirectShow video input device names; callers will fall back to blind index probing",
+            exc_info=True,
+        )
+        return []
