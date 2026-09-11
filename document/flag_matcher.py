@@ -44,6 +44,24 @@ def _scan_name_tokens(doc_fields: dict[str, str]) -> frozenset[str]:
     return normalize_name_tokens(full_name)
 
 
+def match_basis_label(flagged_person: FlaggedPerson) -> str:
+    """Describe which of a flagged-persons entry's own fields find_matching_flagged_person will actually check a scan against -- shown next to the entry in Settings' Flagged Users tab (and, per-scan, via a matched scan's own stored matched_on -- see ui/main_window.py) so an operator can see at a glance what's driving the match, not just that a match happened."""
+    has_name = bool(flagged_person.name)
+    has_personal_number = bool(flagged_person.personal_number)
+    if has_name and has_personal_number:
+        return "Name & personal number"
+    if has_personal_number:
+        return "Personal number"
+    if has_name:
+        return "Name"
+    return "Nothing set -- this entry can never match a scan"
+
+
+def matched_on_display(matched_on: str) -> str:
+    """Human-readable form of a stored FlagMatch.matched_on / flagged_match["matched_on"] value ("name"/"personal_number") -- shared so every place that surfaces it (the retroactive-match dialog, a scan's own flagged badge) uses identical wording."""
+    return "personal number" if matched_on == "personal_number" else "name"
+
+
 def find_matching_flagged_person(doc_fields: dict[str, str], flagged_people: list[FlaggedPerson]) -> FlagMatch | None:
     """Return the first flagged-persons entry whose name and/or personal number matches this scan's extracted fields, else None.
 

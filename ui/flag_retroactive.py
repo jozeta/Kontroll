@@ -28,8 +28,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from document.flag_matcher import find_matching_flagged_person
-from storage.models import FlaggedPerson, ScanRecord, list_scans, set_scan_flagged_match
+from document.flag_matcher import find_matching_flagged_person, matched_on_display
+from storage.models import FlaggedPerson, ScanRecord, list_scans, set_scan_flagged_match, update_flagged_person
+from ui.window_geometry import restore_geometry, save_geometry
+
+_RETROACTIVE_MATCH_DIALOG_GEOMETRY_KEY = "retroactive_match_dialog_geometry"
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +60,7 @@ def run_retroactive_flag_check(conn: sqlite3.Connection, flagged_person: Flagged
     if not candidates:
         return 0
 
-    dialog = _RetroactiveMatchDialog(candidates, parent=parent)
+    dialog = _RetroactiveMatchDialog(candidates, conn, parent=parent)
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return 0
 
@@ -80,13 +83,100 @@ def run_retroactive_flag_check(conn: sqlite3.Connection, flagged_person: Flagged
     return len(selected)
 
 
+def scans_flagged_for_person(conn: sqlite3.Connection, flagged_person_id: int) -> list[ScanRecord]:
+    """Every currently-saved scan whose stored flagged_match currently points at flagged_person_id.
+
+    A read-only counterpart to storage.models.clear_flagged_match_for_person's own query (that one
+    clears as it goes; this one only reads) -- used by apply_flagged_person_edit below to preview
+    and then reconcile the impact of editing a watch-list entry's own matching fields.
+    """
+    return [scan for scan in list_scans(conn, limit=100_000) if _already_flagged_with(scan, flagged_person_id)]
+
+
+def apply_flagged_person_edit(
+    conn: sqlite3.Connection,
+    original: FlaggedPerson,
+    new_name: str | None,
+    new_personal_number: str | None,
+    new_notes: str | None,
+    new_image_path: str | None,
+    parent: QWidget,
+) -> bool:
+    """Apply an edit to an existing flagged-persons watch-list entry, reconciling every scan
+    currently flagged against it with whatever changed, and offering to flag any newly-matching
+    scan the same way a brand new entry would. Returns True once applied, False if the operator
+    canceled after being warned the edit would unflag some scans (nothing is written in that case).
+
+    Shared by both places an operator can correct a flagged person's details: the Edit button on
+    ui/settings_window.py's Flagged Users tab, and ui/main_window.py::HistoryRowWidget.
+    _on_edit_fields_clicked (correcting a flagged scan's own name propagates back to the master
+    watch-list entry it's linked to) -- one shared code path means the two can never silently
+    diverge on the warn-before-unflagging behavior.
+    """
+    updated_person = FlaggedPerson(
+        id=original.id,
+        created_at=original.created_at,
+        name=new_name or None,
+        personal_number=new_personal_number or None,
+        image_path=new_image_path,
+        notes=new_notes or None,
+    )
+
+    currently_flagged = scans_flagged_for_person(conn, original.id)
+    no_longer_matching: list[ScanRecord] = []
+    still_matching: list[tuple[ScanRecord, str]] = []
+    for scan in currently_flagged:
+        doc_fields = json.loads(scan.doc_fields_json) if scan.doc_fields_json else {}
+        match = find_matching_flagged_person(doc_fields, [updated_person])
+        if match is None:
+            no_longer_matching.append(scan)
+        else:
+            still_matching.append((scan, match.matched_on))
+
+    if no_longer_matching:
+        confirm = QMessageBox.question(
+            parent,
+            "Edit flagged person",
+            f"Changing this entry's name/personal number will remove the flag from "
+            f"{len(no_longer_matching)} scan(s) that no longer match the new details. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return False
+
+    update_flagged_person(conn, original.id, new_name, new_personal_number, new_image_path, new_notes)
+    logger.info("Operator edited flagged person id=%d", original.id)
+
+    for scan in no_longer_matching:
+        set_scan_flagged_match(conn, scan.id, None)
+        logger.info("Cleared flag from scan %d: no longer matches edited flagged person id=%d", scan.id, original.id)
+
+    for scan, matched_on in still_matching:
+        set_scan_flagged_match(
+            conn,
+            scan.id,
+            {
+                "flagged_person_id": original.id,
+                "flagged_person_name": updated_person.name,
+                "matched_on": matched_on,
+                "notes": updated_person.notes,
+            },
+        )
+
+    run_retroactive_flag_check(conn, updated_person, parent)
+    return True
+
+
 class _RetroactiveMatchDialog(QDialog):
     """A checklist of previously saved scans that now match a flagged-persons entry, each shown with its visitor image, name, and personal number."""
 
-    def __init__(self, candidates: list[tuple[ScanRecord, str]], parent: QWidget | None = None) -> None:
+    def __init__(self, candidates: list[tuple[ScanRecord, str]], conn: sqlite3.Connection, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Matching Previous Scans Found")
         self.resize(480, 420)
+        restore_geometry(conn, self, _RETROACTIVE_MATCH_DIALOG_GEOMETRY_KEY)
+        self.finished.connect(lambda _result: save_geometry(conn, self, _RETROACTIVE_MATCH_DIALOG_GEOMETRY_KEY))
         self._candidates = candidates
         self._checkboxes: list[QCheckBox] = []
 
@@ -136,7 +226,7 @@ class _RetroactiveMatchDialog(QDialog):
         name_display = f"{doc_fields.get('name', '')} {doc_fields.get('surname', '')}".strip() or "(no name)"
         personal_number_display = doc_fields.get("personal_number") or "-"
         info_column = QVBoxLayout()
-        info_column.addWidget(QLabel(f"<b>{name_display}</b>  (matched on {matched_on})"))
+        info_column.addWidget(QLabel(f"<b>{name_display}</b>  (matched on {matched_on_display(matched_on)})"))
         info_column.addWidget(QLabel(f"Personnummer: {personal_number_display}   Scanned: {scan.created_at}"))
         row_layout.addLayout(info_column, stretch=1)
 

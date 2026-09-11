@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from config.settings import RETENTION_DAYS_NEVER, get_retention_days
-from storage.models import list_scans_older_than
+from storage.models import list_scans_older_than, thumbnail_cache_path
 
 
 def purge_expired_scans(conn: sqlite3.Connection) -> int:
@@ -49,9 +49,9 @@ def purge_scans_older_than_days(conn: sqlite3.Connection, days: int) -> int:
 
 
 def _delete_image_file_if_present(image_path: str | None) -> None:
-    """Remove a captured image file from disk if a path was recorded and the file still exists."""
+    """Remove a captured image file from disk, and its cached thumbnail (see storage.models.thumbnail_cache_path), if a path was recorded and either still exists."""
     if image_path is None:
         return
-    path = Path(image_path)
-    if path.exists():
-        path.unlink()
+    for path in (Path(image_path), thumbnail_cache_path(image_path)):
+        if path.exists():
+            path.unlink()

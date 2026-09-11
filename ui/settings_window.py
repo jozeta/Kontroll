@@ -13,7 +13,7 @@ from typing import Callable
 import numpy as np
 from insightface.app import FaceAnalysis
 from PyQt6.QtCore import QByteArray, QObject, QThread, Qt, pyqtSignal
-from PyQt6.QtGui import QCloseEvent, QKeySequence, QPixmap
+from PyQt6.QtGui import QCloseEvent, QIcon, QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -96,6 +96,7 @@ from config.settings import (
     set_setting,
 )
 from document.country_flags import alpha2_for_country_code
+from document.flag_matcher import match_basis_label
 from document.statistics import (
     compute_daily_volume,
     compute_kpi_trends,
@@ -125,11 +126,12 @@ from storage.models import (
     list_scans,
 )
 from storage.retention import purge_scans_older_than_days
+from ui.app_icon import render_app_logo
 from ui.barcode_calibration_window import BarcodeCalibrationWindow
 from ui.calibration_window import CalibrationWindow
 from ui.charts import BarChartWidget, DonutChartWidget, StatTileWidget, categorical_colors, trend_display
 from ui.flag_icons import render_flag_icon
-from ui.flag_retroactive import run_retroactive_flag_check
+from ui.flag_retroactive import apply_flagged_person_edit, run_retroactive_flag_check
 from ui.frame_display import bgr_frame_to_pixmap, shrink_to_fit
 from ui.image_viewer import ClickableThumbnailLabel
 from ui.statistics_export import build_statistics_report_html
@@ -141,6 +143,7 @@ from ui.statistics_labels import (
     validation_status_label,
 )
 from ui.theme import THEME_CHOICES, THEME_DARK, THEME_LIGHT, THEME_SYSTEM, apply_theme
+from ui.window_geometry import restore_geometry, save_geometry
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +227,9 @@ def _check_all_prerequisites() -> list[PrerequisiteStatus]:
     return [*_check_non_camera_prerequisites(), check_cameras()]
 
 
+_PREREQUISITE_INSTALL_INFO_DIALOG_GEOMETRY_KEY = "prerequisite_install_info_dialog_geometry"
+
+
 class PrerequisiteInstallInfoWindow(QDialog):
     """A small modal window explaining how to satisfy one missing prerequisite, with a one-click installer when available."""
 
@@ -232,12 +238,14 @@ class PrerequisiteInstallInfoWindow(QDialog):
         status: PrerequisiteStatus,
         installer: Callable[[], bool] | None,
         on_installed: Callable[[], None],
+        conn: sqlite3.Connection,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._installer = installer
         self._on_installed = on_installed
         self._status_name = status.name
+        self.finished.connect(lambda _result: save_geometry(conn, self, _PREREQUISITE_INSTALL_INFO_DIALOG_GEOMETRY_KEY))
 
         self.setWindowTitle(f"{status.name} — install instructions")
         layout = QVBoxLayout(self)
@@ -267,6 +275,8 @@ class PrerequisiteInstallInfoWindow(QDialog):
         button_row.addWidget(close_button)
         layout.addLayout(button_row)
 
+        restore_geometry(conn, self, _PREREQUISITE_INSTALL_INFO_DIALOG_GEOMETRY_KEY)
+
     def _on_install_clicked(self) -> None:
         logger.info("Operator triggered install for prerequisite '%s'", self._status_name)
         success = self._installer()
@@ -283,6 +293,85 @@ class PrerequisiteInstallInfoWindow(QDialog):
 _FLAGGED_THUMBNAIL_SIZE = (48, 48)
 
 
+_EDIT_FLAGGED_PERSON_DIALOG_GEOMETRY_KEY = "edit_flagged_person_dialog_geometry"
+
+
+class _EditFlaggedPersonDialog(QDialog):
+    """Edit an existing flagged-persons watch-list entry's name/personal number/notes/reference image -- opened via the Edit button on its row (see _FlaggedPersonRowWidget). Saving is handled by the caller via ui/flag_retroactive.py::apply_flagged_person_edit, which warns first if the change would remove the flag from any currently-flagged scan -- this dialog only collects the new values."""
+
+    def __init__(self, flagged_person: FlaggedPerson, conn: sqlite3.Connection, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Edit Flagged Person")
+        self._conn = conn
+        # Unchanged unless _on_choose_image_clicked picks a new one -- this dialog doesn't force
+        # the operator to re-pick a reference image just to fix a typo'd name.
+        self._image_path = flagged_person.image_path
+
+        layout = QVBoxLayout(self)
+
+        name_row = QHBoxLayout()
+        name_row.addWidget(QLabel("Name:"))
+        self.name_edit = QLineEdit(flagged_person.name or "")
+        name_row.addWidget(self.name_edit, stretch=1)
+        layout.addLayout(name_row)
+
+        number_row = QHBoxLayout()
+        number_row.addWidget(QLabel("Personal number:"))
+        self.personal_number_edit = QLineEdit(flagged_person.personal_number or "")
+        self.personal_number_edit.setPlaceholderText("YYMMDD-XXXX")
+        number_row.addWidget(self.personal_number_edit, stretch=1)
+        layout.addLayout(number_row)
+
+        notes_row = QHBoxLayout()
+        notes_row.addWidget(QLabel("Notes:"))
+        self.notes_edit = QLineEdit(flagged_person.notes or "")
+        self.notes_edit.setPlaceholderText("Optional")
+        notes_row.addWidget(self.notes_edit, stretch=1)
+        layout.addLayout(notes_row)
+
+        image_row = QHBoxLayout()
+        self.image_label = QLabel(Path(self._image_path).name if self._image_path else "No image selected")
+        self.image_label.setStyleSheet("color: gray;")
+        choose_image_button = QPushButton("Choose image...")
+        choose_image_button.clicked.connect(self._on_choose_image_clicked)
+        image_row.addWidget(choose_image_button)
+        image_row.addWidget(self.image_label, stretch=1)
+        layout.addLayout(image_row)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        button_row.addWidget(cancel_button)
+        save_button = QPushButton("Save")
+        save_button.setDefault(True)
+        save_button.clicked.connect(self.accept)
+        button_row.addWidget(save_button)
+        layout.addLayout(button_row)
+
+        self.finished.connect(lambda _result: save_geometry(self._conn, self, _EDIT_FLAGGED_PERSON_DIALOG_GEOMETRY_KEY))
+        restore_geometry(conn, self, _EDIT_FLAGGED_PERSON_DIALOG_GEOMETRY_KEY)
+
+    def _on_choose_image_clicked(self) -> None:
+        file_path, _ = QFileDialog.getOpenFileName(self, "Choose reference image", "", "Images (*.jpg *.jpeg *.png)")
+        if not file_path:
+            return
+        source = Path(file_path)
+        destination = get_flagged_images_dir() / f"{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}_{source.name}"
+        shutil.copyfile(source, destination)
+        self._image_path = str(destination)
+        self.image_label.setText(source.name)
+
+    def values(self) -> tuple[str, str, str, str | None]:
+        """Return (name, personal_number, notes, image_path) once the dialog has been accepted."""
+        return (
+            self.name_edit.text().strip(),
+            self.personal_number_edit.text().strip(),
+            self.notes_edit.text().strip(),
+            self._image_path,
+        )
+
+
 class _FlaggedPersonRowWidget(QFrame):
     """One row in the Flagged Users list: reference thumbnail (if any), name/personal number/notes, and a Remove button."""
 
@@ -295,7 +384,7 @@ class _FlaggedPersonRowWidget(QFrame):
 
         row = QHBoxLayout(self)
 
-        thumbnail_label = ClickableThumbnailLabel(flagged_person.image_path, flagged_person.name or "Flagged person")
+        thumbnail_label = ClickableThumbnailLabel(flagged_person.image_path, flagged_person.name or "Flagged person", conn=conn)
         thumbnail_label.setFixedSize(*_FLAGGED_THUMBNAIL_SIZE)
         pixmap = QPixmap(flagged_person.image_path) if flagged_person.image_path else None
         if pixmap is not None and not pixmap.isNull():
@@ -315,12 +404,33 @@ class _FlaggedPersonRowWidget(QFrame):
         info_column.addWidget(QLabel(f"Personal number: {flagged_person.personal_number or '-'}"))
         if flagged_person.notes:
             info_column.addWidget(QLabel(f"Notes: {flagged_person.notes}"))
+        match_basis_label_widget = QLabel(f"Matches on: {match_basis_label(flagged_person)}")
+        match_basis_label_widget.setStyleSheet("color: gray; font-size: 8pt;")
+        info_column.addWidget(match_basis_label_widget)
         row.addLayout(info_column, stretch=1)
+
+        edit_button = QPushButton("Edit")
+        edit_button.clicked.connect(self._on_edit_clicked)
+        row.addWidget(edit_button)
 
         remove_button = QPushButton("Remove")
         remove_button.setStyleSheet("color: #FF1744;")
         remove_button.clicked.connect(self._on_remove_clicked)
         row.addWidget(remove_button)
+
+    def _on_edit_clicked(self) -> None:
+        dialog = _EditFlaggedPersonDialog(self.flagged_person, self.conn, parent=self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        name, personal_number, notes, image_path = dialog.values()
+        if not name and not personal_number:
+            QMessageBox.warning(self, "Edit flagged person", "Check and fill in at least a name or a personal number.")
+            return
+        applied = apply_flagged_person_edit(
+            self.conn, self.flagged_person, name or None, personal_number or None, notes or None, image_path, self
+        )
+        if applied:
+            self._on_removed()  # reuses the same "refresh the whole list + notify MainWindow" callback add/remove already use
 
     def _on_remove_clicked(self) -> None:
         confirm = QMessageBox.question(
@@ -473,15 +583,20 @@ def _format_camera_diagnostics_report(
     return "\n".join(lines)
 
 
+_CAMERA_DIAGNOSTICS_DIALOG_GEOMETRY_KEY = "camera_diagnostics_dialog_geometry"
+
+
 class _CameraDiagnosticsDialog(QDialog):
     """Shows a camera diagnostics report (see _format_camera_diagnostics_report) as read-only,
     selectable, monospace text, with quick actions to copy it or save it to a file -- for pasting
     into a bug report or sending to whoever is troubleshooting a camera issue remotely."""
 
-    def __init__(self, report_text: str, title: str, parent: QWidget | None = None) -> None:
+    def __init__(self, report_text: str, title: str, conn: sqlite3.Connection, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(640, 560)
+        restore_geometry(conn, self, _CAMERA_DIAGNOSTICS_DIALOG_GEOMETRY_KEY)
+        self.finished.connect(lambda _result: save_geometry(conn, self, _CAMERA_DIAGNOSTICS_DIALOG_GEOMETRY_KEY))
         self._report_text = report_text
 
         layout = QVBoxLayout(self)
@@ -567,6 +682,9 @@ class SettingsWindow(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent, Qt.WindowType.Window)
+        # See ui/main_window.py::MainWindow's identical call for why this is set explicitly rather
+        # than relying solely on QApplication.setWindowIcon's application-wide default.
+        self.setWindowIcon(QIcon(render_app_logo(64)))
         self.conn = conn
         self.camera_manager = camera_manager
         self.face_analysis_app = face_analysis_app
@@ -786,6 +904,15 @@ class SettingsWindow(QWidget):
         doc_type_layout.addWidget(self.statistics_doc_type_chart)
         layout.addWidget(doc_type_group)
 
+        age_group = QGroupBox("Age distribution")
+        age_layout = QVBoxLayout(age_group)
+        age_caption = QLabel("Only scans with a readable birth date are counted.")
+        age_caption.setStyleSheet("font-size: 8pt;")
+        age_layout.addWidget(age_caption)
+        self.statistics_age_chart = DonutChartWidget()
+        age_layout.addWidget(self.statistics_age_chart)
+        layout.addWidget(age_group)
+
         nationality_group = QGroupBox("Nationality / issuing country (top 10)")
         nationality_layout = QVBoxLayout(nationality_group)
         self.statistics_nationality_chart = BarChartWidget(orientation="horizontal")
@@ -869,6 +996,19 @@ class SettingsWindow(QWidget):
             for doc_type, count in stats.doc_type_counts.items()
         ]
         self.statistics_doc_type_chart.set_data(doc_type_items)
+
+        # Fixed bucket order (youngest to oldest, see document/statistics.py::_AGE_BUCKETS), not
+        # sorted by count like the other donut charts above -- age reads naturally left-to-right/
+        # young-to-old. Colors are assigned positionally from the categorical palette rather than
+        # via a label->color lookup (unlike doc_type_color/validation_status_color) since there's
+        # no separately-registered color for an age bucket anywhere else in the app to stay
+        # consistent with.
+        age_palette = categorical_colors(self.statistics_age_chart)
+        age_items = [
+            (label, count, age_palette[index % len(age_palette)])
+            for index, (label, count) in enumerate(stats.age_bucket_counts.items())
+        ]
+        self.statistics_age_chart.set_data(age_items)
 
         nationality_items = top_n_with_other(stats.nationality_counts, 10)
         nationality_icons = [
@@ -1537,7 +1677,7 @@ class SettingsWindow(QWidget):
         report_text = _format_camera_diagnostics_report(side_label, diagnostics, configured_resolution, stats)
         logger.info("Operator exported %s camera (index %d) diagnostics", side_label, camera_index)
 
-        dialog = _CameraDiagnosticsDialog(report_text, f"{side_label} Camera Diagnostics", self)
+        dialog = _CameraDiagnosticsDialog(report_text, f"{side_label} Camera Diagnostics", self.conn, self)
         dialog.exec()
 
     # -- Camera assignment ----------------------------------------------------------------------
@@ -2060,7 +2200,10 @@ class SettingsWindow(QWidget):
         logger.info("Operator opened the face match calibration window")
         if self._calibration_window is None:
             self._calibration_window = CalibrationWindow(
-                self.camera_manager, self.face_analysis_app, on_apply_threshold=self._on_calibration_threshold_applied
+                self.camera_manager,
+                self.face_analysis_app,
+                on_apply_threshold=self._on_calibration_threshold_applied,
+                conn=self.conn,
             )
         self._calibration_window.show()
         self._calibration_window.raise_()
@@ -2142,7 +2285,9 @@ class SettingsWindow(QWidget):
         logger.info("Operator opened the barcode/OCR overlap calibration window")
         if self._barcode_calibration_window is None:
             self._barcode_calibration_window = BarcodeCalibrationWindow(
-                self.camera_manager, on_apply_threshold=self._on_barcode_calibration_threshold_applied
+                self.camera_manager,
+                on_apply_threshold=self._on_barcode_calibration_threshold_applied,
+                conn=self.conn,
             )
         self._barcode_calibration_window.show()
         self._barcode_calibration_window.raise_()
@@ -2266,5 +2411,7 @@ class SettingsWindow(QWidget):
         # e.g. "Python packages" when running as a frozen EXE, where there's no venv/pip to
         # install into -- so it must gate the lookup, not just presence in the installers dict.
         installer = _PREREQUISITE_INSTALLERS.get(prerequisite_name) if status.can_auto_install else None
-        info_window = PrerequisiteInstallInfoWindow(status, installer, on_installed=self._refresh_prerequisites, parent=self)
+        info_window = PrerequisiteInstallInfoWindow(
+            status, installer, on_installed=self._refresh_prerequisites, conn=self.conn, parent=self
+        )
         info_window.exec()

@@ -8,13 +8,15 @@ would be circular.
 import json
 import logging
 import shutil
+import sqlite3
+import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal
 
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
-from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
+from PyQt6.QtCore import QObject, QPoint, QRect, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QColor, QPainter, QPen, QPixmap, QResizeEvent, QWheelEvent
 from PyQt6.QtWidgets import (
     QApplication,
@@ -38,10 +40,14 @@ from document.dates import parse_mrz_style_date
 from document.field_extraction import extract_document_fields
 from document.ocr import preview_ocr_preprocessing
 from face.embedder import face_bbox_area
-from ui.frame_display import bgr_frame_to_pixmap
+from ui.frame_display import THUMBNAIL_SIZE, bgr_frame_to_pixmap, write_thumbnail_cache
+from ui.window_geometry import restore_geometry, save_geometry
 
 if TYPE_CHECKING:
     from storage.models import ScanRecord
+
+_IMAGE_VIEWER_GEOMETRY_KEY = "image_viewer_window_geometry"
+_IMAGE_EDIT_DIALOG_GEOMETRY_KEY = "image_edit_dialog_geometry"
 
 logger = logging.getLogger(__name__)
 
@@ -235,11 +241,26 @@ class _ZoomableImageView(QScrollArea):
             return (0.0, 0.0)
         return (fraction[0] * pixmap.width(), fraction[1] * pixmap.height())
 
+    def _viewport_pos_to_label_px(self, viewport_x: float, viewport_y: float) -> tuple[float, float]:
+        """Convert a point in this scroll area's viewport-local pixels into image_label's own pixel coordinate space.
+
+        Accounts for both the current scroll offset and any centering margin QScrollArea's own
+        AlignCenter (see __init__) adds around image_label when it's smaller than the viewport --
+        e.g. a small face crop shown in a much larger window, or (in _CropZoomView, which has this
+        same conversion) an image whose fitted size shrank well below the viewport right after a
+        90-degree rotation swapped its aspect ratio. A plain "scrollbar value + viewport position"
+        sum (this method's previous form) has no way to know about that margin and is only correct
+        when image_label happens to fill the viewport exactly -- mapTo reads the label's actual
+        on-screen position instead, which is correct in both cases (when content is smaller than
+        the viewport, mapTo reflects the centering margin directly; when it's larger, scrolling
+        moves the label itself, so mapTo already reflects that too -- no separate scroll-offset
+        term needed).
+        """
+        label_origin = self.image_label.mapTo(self.viewport(), QPoint(0, 0))
+        return (viewport_x - label_origin.x(), viewport_y - label_origin.y())
+
     def _current_center_in_label_px(self) -> tuple[float, float]:
-        return (
-            self.horizontalScrollBar().value() + self.viewport().width() / 2,
-            self.verticalScrollBar().value() + self.viewport().height() / 2,
-        )
+        return self._viewport_pos_to_label_px(self.viewport().width() / 2, self.viewport().height() / 2)
 
     def _set_center_in_label_px(self, point_px: tuple[float, float]) -> None:
         self.horizontalScrollBar().setValue(round(point_px[0] - self.viewport().width() / 2))
@@ -286,10 +307,7 @@ class _ZoomableImageView(QScrollArea):
             return
 
         cursor_viewport_pos = self.viewport().mapFromGlobal(event.globalPosition().toPoint())
-        old_label_px = (
-            self.horizontalScrollBar().value() + cursor_viewport_pos.x(),
-            self.verticalScrollBar().value() + cursor_viewport_pos.y(),
-        )
+        old_label_px = self._viewport_pos_to_label_px(cursor_viewport_pos.x(), cursor_viewport_pos.y())
         cursor_fraction = self._label_px_to_fraction(old_label_px)
 
         zoom_multiplier = _ZOOM_WHEEL_STEP if event.angleDelta().y() > 0 else (1 / _ZOOM_WHEEL_STEP)
@@ -549,13 +567,17 @@ class _CropZoomView(QScrollArea):
         """The actual on-screen pixel scale currently applied to base_pixmap -- fit scale times the operator's own zoom level on top of it."""
         return self._fit_scale() * self._zoom_level
 
+    def _viewport_pos_to_label_px(self, viewport_x: float, viewport_y: float) -> tuple[float, float]:
+        """Convert a point in this scroll area's viewport-local pixels into image_label's own pixel coordinate space -- see _ZoomableImageView's identical method for why mapTo (not a plain scrollbar-value sum) is needed: it also accounts for the centering margin QScrollArea's own AlignCenter adds whenever image_label is smaller than the viewport, e.g. right after a 90-degree rotation shrinks the fitted image well below the viewport's own (now-mismatched) aspect ratio -- exactly the case that made a freshly-drawn crop rectangle start at the wrong point relative to the actual click."""
+        label_origin = self.image_label.mapTo(self.viewport(), QPoint(0, 0))
+        return (viewport_x - label_origin.x(), viewport_y - label_origin.y())
+
     def _current_center_fraction(self) -> tuple[float, float]:
         """The 0..1 fraction of base_pixmap currently centered in the viewport -- used by resizeEvent to keep the same content centered across a window resize, mirroring _ZoomableImageView's identical need."""
         pixmap = self.image_label.pixmap()
         if pixmap is None or pixmap.isNull() or pixmap.width() == 0 or pixmap.height() == 0:
             return (0.5, 0.5)
-        center_x = self.horizontalScrollBar().value() + self.viewport().width() / 2
-        center_y = self.verticalScrollBar().value() + self.viewport().height() / 2
+        center_x, center_y = self._viewport_pos_to_label_px(self.viewport().width() / 2, self.viewport().height() / 2)
         return (center_x / pixmap.width(), center_y / pixmap.height())
 
     def resizeEvent(self, event: QResizeEvent | None) -> None:
@@ -604,14 +626,13 @@ class _CropZoomView(QScrollArea):
         self.image_label.resize(scaled.size())
 
     def _viewport_pos_to_base(self, viewport_pos: QPoint) -> QPoint:
-        """Convert a click position (in this scroll area's viewport-local pixels) into base_pixmap's own stable pixel coordinate space, accounting for both the current scroll offset and zoom level.
+        """Convert a click position (in this scroll area's viewport-local pixels) into base_pixmap's own stable pixel coordinate space, accounting for the current scroll offset, any AlignCenter margin (see _viewport_pos_to_label_px), and zoom level.
 
         Clamped to base_pixmap's own bounds -- a drag that continues past the label's edge (e.g.
         into the scrollbar area, or beyond the viewport while zoomed in) would otherwise produce a
         crop_rect coordinate outside the image entirely.
         """
-        label_px_x = self.horizontalScrollBar().value() + viewport_pos.x()
-        label_px_y = self.verticalScrollBar().value() + viewport_pos.y()
+        label_px_x, label_px_y = self._viewport_pos_to_label_px(viewport_pos.x(), viewport_pos.y())
         scale = self._display_scale() or 1.0
         base_x = round(label_px_x / scale)
         base_y = round(label_px_y / scale)
@@ -710,6 +731,36 @@ def _sharpen_image(image: np.ndarray, strength: int) -> np.ndarray:
     return cv2.addWeighted(image, weight_factor, blurred, 1.0 - weight_factor, 0)
 
 
+_ROTATION_CODES = {1: cv2.ROTATE_90_CLOCKWISE, 2: cv2.ROTATE_180, 3: cv2.ROTATE_90_COUNTERCLOCKWISE}
+
+
+def _rotate_image(image: np.ndarray, quarter_turns: int) -> np.ndarray:
+    """Rotate image clockwise by quarter_turns * 90 degrees (0-3, wrapping), e.g. for a card/photo captured sideways or upside down. quarter_turns=0 returns image unchanged rather than a needless copy."""
+    quarter_turns %= 4
+    if quarter_turns == 0:
+        return image
+    return cv2.rotate(image, _ROTATION_CODES[quarter_turns])
+
+
+class _FieldCheckWorker(QObject):
+    """Runs extract_document_fields on a background thread -- see ImageEditDialog._run_field_check, which owns the QThread this is moved to. Mirrors ui/main_window.py::_CaptureAnalysisWorker's own shape (a plain QObject moved via moveToThread, not a QThread subclass) for the same reasons, including catching and forwarding an exception via a signal rather than letting it propagate: an exception raised on a QThread never reaches the main thread's own try/except at all, which is exactly what let a real extraction failure (confirmed with a missing-Tesseract install) crash the whole app outright before this was backgrounded -- PyQt6's default behavior for an unhandled exception in a slot."""
+
+    finished = pyqtSignal(dict)  # extracted doc_fields
+    failed = pyqtSignal(str)  # traceback text
+
+    def __init__(self, image: np.ndarray) -> None:
+        super().__init__()
+        self._image = image
+
+    def run(self) -> None:
+        try:
+            result = extract_document_fields(self._image)
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+            return
+        self.finished.emit(result.doc_fields)
+
+
 class ImageEditDialog(QDialog):
     """Lets the operator crop and adjust brightness/contrast on one saved scan image (face or
     document), applied in place to the file at image_path -- opened from ImageViewerWindow's
@@ -749,17 +800,28 @@ class ImageEditDialog(QDialog):
         kind: ThumbnailKind | None = None,
         face_analysis_app: FaceAnalysis | None = None,
         scan: "ScanRecord | None" = None,
+        conn: sqlite3.Connection | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
         self._image_path = image_path
         self._kind = kind
+        self._conn = conn
+        if conn is not None:
+            self.finished.connect(lambda _result: save_geometry(conn, self, _IMAGE_EDIT_DIALOG_GEOMETRY_KEY))
         self._original_bgr = cv2.imread(image_path)
         self._original_doc_fields: dict[str, str] = (
             json.loads(scan.doc_fields_json) if scan is not None and scan.doc_fields_json else {}
         )
         self.applied = False
+        self._rotation_quarter_turns = 0
+        # Initialized here (before the "image not found" early-return below can skip past the
+        # rest of __init__) since done() unconditionally checks _field_check_thread regardless of
+        # which branch of this constructor ran -- see done()'s own docstring.
+        self._field_check_thread: QThread | None = None
+        self._field_check_worker: "_FieldCheckWorker | None" = None
+        self._field_check_rerun_needed = False
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
@@ -786,6 +848,14 @@ class ImageEditDialog(QDialog):
         crop_row = QHBoxLayout()
         crop_row.addWidget(QLabel("Scroll to zoom. Drag on the image to select a crop region."))
         crop_row.addStretch(1)
+        rotate_left_button = QPushButton("⟲ Rotate left")
+        rotate_left_button.setToolTip("Rotate the image 90° counter-clockwise")
+        rotate_left_button.clicked.connect(lambda: self._on_rotate_clicked(-1))
+        crop_row.addWidget(rotate_left_button)
+        rotate_right_button = QPushButton("⟳ Rotate right")
+        rotate_right_button.setToolTip("Rotate the image 90° clockwise")
+        rotate_right_button.clicked.connect(lambda: self._on_rotate_clicked(1))
+        crop_row.addWidget(rotate_right_button)
         reset_zoom_button = QPushButton("Reset zoom")
         reset_zoom_button.clicked.connect(self.crop_view.reset_zoom)
         crop_row.addWidget(reset_zoom_button)
@@ -854,6 +924,9 @@ class ImageEditDialog(QDialog):
 
         # Only meaningful for a document image -- a face photo has no identity fields to extract,
         # and running card-detection/OCR/MRZ/barcode against one would just waste time.
+        # (self._field_check_thread/_worker/_rerun_needed -- the background-thread bookkeeping for
+        # _run_field_check, see that method and _FieldCheckWorker -- are initialized earlier, near
+        # the top of __init__; see the comment there for why.)
         self._field_check_timer: QTimer | None = None
         if kind == "document":
             field_check_row = QHBoxLayout()
@@ -894,36 +967,75 @@ class ImageEditDialog(QDialog):
         # card itself occupying only a modest fraction of it (see document/card_detector.py's own
         # diagnosis), so without this an operator opening Edit would first have to manually scroll-
         # zoom to the small region that's actually relevant before any brightness/contrast/sharpen
-        # adjustment is even visible at a useful scale. Deferred via singleShot(0, ...) for the same
-        # reason ImageViewerWindow's own auto-zoom is: crop_view's scrollbar ranges aren't reliably
-        # established until after this dialog has actually been shown and laid out once.
-        bbox = None
+        # adjustment is even visible at a useful scale. Both *detecting* the region (a real,
+        # if brief -- tens to hundreds of ms -- blocking call, not just applying its result) are
+        # deferred via singleShot(0, ...): crop_view's scrollbar ranges aren't reliably established
+        # until after this dialog has actually been shown and laid out once, and running detection
+        # here in __init__ (the previous approach) delayed the dialog's own first appearance by
+        # however long detection took, instead of showing it immediately at a fitted view and
+        # zooming in a moment later -- see _apply_auto_zoom.
         if kind is not None:
-            try:
-                bbox = _find_zoom_bbox(self._original_bgr, kind, face_analysis_app)
-            except Exception:
-                logger.warning("Auto-zoom detection failed for %s image at %s", kind, image_path, exc_info=True)
-        if bbox is not None:
-            image_height, image_width = self._original_bgr.shape[:2]
-            center_fraction, zoom_level = _zoom_params_for_bbox(image_width, image_height, bbox)
-            QTimer.singleShot(0, lambda: self.crop_view.zoom_to_region(center_fraction, zoom_level))
+            QTimer.singleShot(0, lambda: QTimer.singleShot(0, lambda: self._apply_auto_zoom(kind, face_analysis_app)))
 
         # Resizable, not fixed -- an operator can make the preview larger still on a big monitor;
         # _CropZoomView.resizeEvent keeps the same content centered when this happens.
         self.setMinimumSize(*_EDIT_DIALOG_MIN_SIZE)
         self.resize(*_EDIT_DIALOG_INITIAL_SIZE)
+        if conn is not None:
+            restore_geometry(conn, self, _IMAGE_EDIT_DIALOG_GEOMETRY_KEY)
         self._refresh_preview()
         if self._field_check_timer is not None:
             # Run once automatically so the operator sees the Original/New comparison immediately
-            # on opening, without first having to touch a slider -- deferred via singleShot(0, ...)
-            # rather than called directly here so the dialog itself appears right away instead of
-            # this (up to ~1s) extraction pass blocking its own construction.
-            QTimer.singleShot(0, self._run_field_check)
+            # on opening, without first having to touch a slider. Deferred via a *chained pair* of
+            # singleShot(0, ...) calls, not just one: a single singleShot(0, ...) armed here (during
+            # __init__, before this dialog has even been shown) doesn't reliably fire after the
+            # dialog's first real paint -- Qt has no guarantee a 0ms timer queued this early runs
+            # after the paint event a subsequent show()/exec() call will queue, and in practice it
+            # often ran first, letting this extraction pass (up to ~1s) block the UI thread before
+            # the dialog had drawn anything, showing as a blank white window for that whole stretch
+            # (a real operator report, not a theoretical race). Chaining a second singleShot(0, ...)
+            # inside the first gives the event loop a full extra turn to service other already-
+            # queued events (in particular that first paint) before the heavy call runs -- unlike
+            # calling QApplication.processEvents() directly here (the first attempt at this fix),
+            # which pumps the event loop *reentrantly* from inside a slot the event loop is already
+            # in the middle of dispatching and reproducibly crashed the process outright when
+            # nested against this same dialog's other deferred callback (_apply_auto_zoom) doing the
+            # same thing -- confirmed via a standalone repro before settling on this instead.
+            QTimer.singleShot(0, lambda: QTimer.singleShot(0, self._run_field_check))
+
+    def _apply_auto_zoom(self, kind: ThumbnailKind, face_analysis_app: FaceAnalysis | None) -> None:
+        """Detect the face/card region and zoom crop_view to it -- see the singleShot(0, ...) call in __init__ for why this whole method (not just applying its result) is deferred until after this dialog's first paint, rather than run directly during construction."""
+        try:
+            bbox = _find_zoom_bbox(self._original_bgr, kind, face_analysis_app)
+        except Exception:
+            logger.warning("Auto-zoom detection failed for %s image at %s", kind, self._image_path, exc_info=True)
+            bbox = None
+        if bbox is not None:
+            image_height, image_width = self._original_bgr.shape[:2]
+            center_fraction, zoom_level = _zoom_params_for_bbox(image_width, image_height, bbox)
+            self.crop_view.zoom_to_region(center_fraction, zoom_level)
+
+    def _on_rotate_clicked(self, delta: int) -> None:
+        """Rotate the working image a further 90° (delta=+1 clockwise, -1 counter-clockwise), applied first (before brightness/contrast/sharpen -- see _adjusted_full_image) and persisted on Apply like any other adjustment.
+
+        Any existing crop selection is cleared first: it's expressed in the pre-rotation image's
+        own pixel coordinates (crop_view.crop_rect, see _crop_rect_to_image_bounds), which a 90°
+        turn invalidates outright (width/height swap) and even a 180° turn would silently mis-place
+        (top-left becomes bottom-right). Zoom is then reset to re-fit the new (possibly
+        width/height-swapped) image rather than keeping whatever pixel region the old zoom/pan
+        happened to be centered on.
+        """
+        self._rotation_quarter_turns = (self._rotation_quarter_turns + delta) % 4
+        self.crop_view.reset_crop()
+        self._refresh_preview()
+        self.crop_view.reset_zoom()
+        self._schedule_field_check()
 
     def _adjusted_full_image(self) -> np.ndarray:
+        rotated = _rotate_image(self._original_bgr, self._rotation_quarter_turns)
         alpha = self.contrast_slider.value() / 100
         beta = self.brightness_slider.value()
-        adjusted = cv2.convertScaleAbs(self._original_bgr, alpha=alpha, beta=beta)
+        adjusted = cv2.convertScaleAbs(rotated, alpha=alpha, beta=beta)
         adjusted = _sharpen_image(adjusted, self.sharpen_slider.value())
         if self.grayscale_checkbox.isChecked():
             # Converted back to 3-channel BGR (not left single-channel) so every downstream
@@ -976,16 +1088,59 @@ class ImageEditDialog(QDialog):
         self._field_check_timer.start(_FIELD_CHECK_DEBOUNCE_MS)
 
     def _run_field_check(self) -> None:
-        """Run the real document classification + field-extraction pipeline over the current adjusted-and-cropped image and show a before/after comparison against the scan's currently-saved fields -- an objective answer to "is this edit actually helping extraction" instead of judging a low-quality image by eye. Synchronous (blocks this modal dialog only, with a wait cursor) -- matches this codebase's existing pattern for other occasional, few-hundred-ms-to-~1s operations (e.g. resolution probing, backup)."""
+        """Run the real document classification + field-extraction pipeline over the current adjusted-and-cropped image and show a before/after comparison against the scan's currently-saved fields -- an objective answer to "is this edit actually helping extraction" instead of judging a low-quality image by eye.
+
+        Runs on a background thread (see _FieldCheckWorker) rather than blocking this dialog the
+        way this used to -- both to keep the UI responsive during the up-to-~1s extraction pass,
+        and because an exception raised inside it (confirmed with a real missing-Tesseract error)
+        previously crashed the whole app outright, which backgrounding it with the same
+        catch-and-emit pattern ui/main_window.py::_CaptureAnalysisWorker already uses fixes as a
+        side effect. If a check is already running, this just notes that a fresher one is wanted
+        (see self._field_check_rerun_needed) instead of starting a second, overlapping worker --
+        _on_field_check_finished/_failed re-invoke this once the in-flight one completes.
+        """
         if self._field_check_timer is None:
             return
         self._field_check_timer.stop()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            new_fields = extract_document_fields(self._current_test_image()).doc_fields
-        finally:
-            QApplication.restoreOverrideCursor()
+        if self._field_check_thread is not None:
+            self._field_check_rerun_needed = True
+            return
+
+        self.field_check_label.setText("Extracted fields: checking…")
+        test_image = self._current_test_image()
+
+        thread = QThread(self)
+        worker = _FieldCheckWorker(test_image)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_field_check_finished)
+        worker.failed.connect(self._on_field_check_failed)
+        self._field_check_thread = thread
+        self._field_check_worker = worker
+        thread.start()
+
+    def _cleanup_field_check_thread(self) -> None:
+        if self._field_check_thread is None:
+            return
+        self._field_check_thread.quit()
+        self._field_check_thread.wait()
+        self._field_check_thread = None
+        self._field_check_worker = None
+
+    def _on_field_check_finished(self, new_fields: dict) -> None:
+        self._cleanup_field_check_thread()
         self.field_check_label.setText(_render_field_comparison_html(self._original_doc_fields, new_fields))
+        if self._field_check_rerun_needed:
+            self._field_check_rerun_needed = False
+            self._run_field_check()
+
+    def _on_field_check_failed(self, traceback_text: str) -> None:
+        logger.error("Field-check extraction failed on a background thread:\n%s", traceback_text)
+        self._cleanup_field_check_thread()
+        self.field_check_label.setText("Extracted fields: check failed -- see the log for details.")
+        if self._field_check_rerun_needed:
+            self._field_check_rerun_needed = False
+            self._run_field_check()
 
     def _on_reset_adjustments_clicked(self) -> None:
         self.brightness_slider.setValue(0)
@@ -1023,9 +1178,22 @@ class ImageEditDialog(QDialog):
 
         self._backup_original_if_needed()
         cv2.imwrite(self._image_path, result)
+        # Regenerated from the same in-memory result just written above (no extra disk read) so a
+        # stale pre-edit thumbnail is never shown afterward -- see
+        # ui/main_window.py::_load_thumbnail's own docstring for the cache this keeps in sync with.
+        write_thumbnail_cache(self._image_path, result, THUMBNAIL_SIZE[0], THUMBNAIL_SIZE[1])
         logger.info("Operator applied brightness/contrast/sharpen/crop edits to %s", self._image_path)
         self.applied = True
         self.accept()
+
+    def done(self, result: int) -> None:
+        """Decline to close (Apply, Cancel, or the window's own X button all funnel through here) while a field-check is still running on its background thread -- mirrors MainWindow.closeEvent's identical guard against closing during its own background capture-analysis thread, for the same reason: letting the dialog (and this QThread/worker along with it) get torn down while still running isn't safe. A field check is brief (up to ~1s), so this is a short wait in practice, not a real workflow obstacle."""
+        if self._field_check_thread is not None:
+            QMessageBox.information(
+                self, "Please wait", "Field extraction is still checking -- please wait for it to finish before closing."
+            )
+            return
+        super().done(result)
 
 
 class ImageViewerWindow(QWidget):
@@ -1059,6 +1227,7 @@ class ImageViewerWindow(QWidget):
         face_analysis_app: FaceAnalysis | None = None,
         scan: "ScanRecord | None" = None,
         on_reanalyze: Callable[["ScanRecord"], None] | None = None,
+        conn: sqlite3.Connection | None = None,
     ) -> None:
         super().__init__()
         self.setWindowTitle(title)
@@ -1067,8 +1236,9 @@ class ImageViewerWindow(QWidget):
         self._face_analysis_app = face_analysis_app
         self._scan = scan
         self._on_reanalyze = on_reanalyze
+        self._conn = conn
         # (center_fraction, zoom_level) for the detected region, once/if found -- see
-        # _try_find_zoom_region. None means nothing was detected (or kind is None), in which case
+        # _apply_auto_zoom_region. None means nothing was detected (or kind is None), in which case
         # zoom_to_region_button never appears.
         self._zoom_region_params: tuple[tuple[float, float], float] | None = None
 
@@ -1096,6 +1266,8 @@ class ImageViewerWindow(QWidget):
         # depends on the viewport already having its real size; a resize after loading would leave
         # the very first frame computed against a stale/default size.
         self.resize(900, 700)
+        if conn is not None:
+            restore_geometry(conn, self, _IMAGE_VIEWER_GEOMETRY_KEY)
 
         pixmap = QPixmap(image_path)
         if pixmap.isNull():
@@ -1106,41 +1278,56 @@ class ImageViewerWindow(QWidget):
             layout.insertWidget(0, error_label)
             return
 
-        initial_center, initial_zoom = self._try_find_zoom_region(image_path, pixmap, face_analysis_app)
-        self.image_view.set_image(pixmap, initial_zoom_level=initial_zoom, initial_center_fraction=initial_center)
+        # Shown fitted immediately -- detecting the face/card region (a real, if brief, blocking
+        # call) and jumping to it is deferred to _apply_auto_zoom_region, via a 0ms timer fired
+        # once this window has actually been shown and painted (this constructor returns and the
+        # caller's own .show() call runs before control returns to the event loop the timer fires
+        # on). Running detection here instead -- the previous approach -- delayed this window's
+        # very first appearance on a thumbnail double-click by however long detection took, which
+        # is exactly backwards: an operator should see the window open right away and zoom in a
+        # moment later, not stare at nothing happening until detection finishes.
+        self.image_view.set_image(pixmap)
+        if kind is not None:
+            # Chained pair of singleShot(0, ...) calls, not just one -- see the equivalent comment
+            # on ImageEditDialog.__init__'s own field-check auto-run for why: a single 0ms timer
+            # armed this early doesn't reliably fire after this window's first real paint, and
+            # QApplication.processEvents() (the first attempt at fixing that) pumps the event loop
+            # reentrantly from inside a slot it's already in the middle of dispatching, which
+            # reproducibly crashed the process outright when nested against another deferred
+            # callback doing the same thing.
+            QTimer.singleShot(0, lambda: QTimer.singleShot(0, lambda: self._apply_auto_zoom_region(image_path, pixmap, face_analysis_app)))
 
-    def _try_find_zoom_region(
-        self, image_path: str, pixmap: QPixmap, face_analysis_app: FaceAnalysis | None
-    ) -> tuple[tuple[float, float], float]:
-        """Return the (center_fraction, zoom_level) to open the viewer at: the detected face/card region if one was found, else the whole image fitted. Never raises -- a detection failure just falls back to the fitted view, same as no kind being given at all."""
-        if self._kind is not None:
-            image_bgr = cv2.imread(image_path)
-            if image_bgr is not None:
-                # Face detection in particular is a real, if brief (well under a second on CPU for
-                # one still image), blocking call -- a wait cursor matches how this codebase
-                # already signals other one-off blocking operations (e.g. resolution probing,
-                # backup) elsewhere.
-                QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-                try:
-                    bbox = _find_zoom_bbox(image_bgr, self._kind, face_analysis_app)
-                except Exception:
-                    logger.warning("Auto-zoom detection failed for %s capture at %s", self._kind, image_path, exc_info=True)
-                    bbox = None
-                finally:
-                    QApplication.restoreOverrideCursor()
-                if bbox is not None:
-                    self._zoom_region_params = _zoom_params_for_bbox(pixmap.width(), pixmap.height(), bbox)
-                    self.zoom_to_region_button.setText(
-                        "Zoom to detected face" if self._kind == "face" else "Zoom to detected card"
-                    )
-                    self.zoom_to_region_button.setVisible(True)
-                    return self._zoom_region_params
-        return ((0.5, 0.5), _MIN_ZOOM_LEVEL)
+    def _apply_auto_zoom_region(self, image_path: str, pixmap: QPixmap, face_analysis_app: FaceAnalysis | None) -> None:
+        """Detect the face/card region and zoom to it -- see the singleShot(0, ...) call in __init__ for why this is deferred until after this window's first paint rather than run directly during construction. Never raises -- a detection failure just leaves the fitted view already showing in place, same as no kind being given at all."""
+        image_bgr = cv2.imread(image_path)
+        if image_bgr is None:
+            return
+        # Face detection in particular is a real, if brief (well under a second on CPU for one
+        # still image), blocking call -- a wait cursor matches how this codebase already signals
+        # other one-off blocking operations (e.g. resolution probing, backup) elsewhere.
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            bbox = _find_zoom_bbox(image_bgr, self._kind, face_analysis_app)
+        except Exception:
+            logger.warning("Auto-zoom detection failed for %s capture at %s", self._kind, image_path, exc_info=True)
+            bbox = None
+        finally:
+            QApplication.restoreOverrideCursor()
+        if bbox is not None:
+            self._zoom_region_params = _zoom_params_for_bbox(pixmap.width(), pixmap.height(), bbox)
+            self.zoom_to_region_button.setText("Zoom to detected face" if self._kind == "face" else "Zoom to detected card")
+            self.zoom_to_region_button.setVisible(True)
+            self.image_view.zoom_to_region(*self._zoom_region_params)
 
     def _on_zoom_to_region_clicked(self) -> None:
         if self._zoom_region_params is not None:
             center_fraction, zoom_level = self._zoom_region_params
             self.image_view.zoom_to_region(center_fraction, zoom_level)
+
+    def closeEvent(self, event) -> None:
+        if self._conn is not None:
+            save_geometry(self._conn, self, _IMAGE_VIEWER_GEOMETRY_KEY)
+        super().closeEvent(event)
 
     def _on_edit_image_clicked(self) -> None:
         """Open ImageEditDialog for this image; on Apply, reload the viewer's own display and offer to re-analyze the scan with the corrected image."""
@@ -1150,6 +1337,7 @@ class ImageViewerWindow(QWidget):
             kind=self._kind,
             face_analysis_app=self._face_analysis_app,
             scan=self._scan,
+            conn=self._conn,
             parent=self,
         )
         dialog.exec()
@@ -1191,6 +1379,7 @@ class ClickableThumbnailLabel(QLabel):
         face_analysis_app: FaceAnalysis | None = None,
         scan: "ScanRecord | None" = None,
         on_reanalyze: Callable[["ScanRecord"], None] | None = None,
+        conn: sqlite3.Connection | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -1200,6 +1389,7 @@ class ClickableThumbnailLabel(QLabel):
         self._face_analysis_app = face_analysis_app
         self._scan = scan
         self._on_reanalyze = on_reanalyze
+        self._conn = conn
         # Kept alive by this reference for as long as the thumbnail itself lives -- a top-level
         # PyQt widget with no Python reference held anywhere is garbage-collected out from under
         # its own open window.
@@ -1214,6 +1404,7 @@ class ClickableThumbnailLabel(QLabel):
                 face_analysis_app=self._face_analysis_app,
                 scan=self._scan,
                 on_reanalyze=self._on_reanalyze,
+                conn=self._conn,
             )
             self._viewer.show()
         super().mouseDoubleClickEvent(event)

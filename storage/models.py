@@ -7,6 +7,20 @@ from datetime import datetime
 from pathlib import Path
 
 
+def thumbnail_cache_path(image_path: str) -> Path:
+    """The path of the small cached thumbnail file for a saved scan image, next to the full-
+    resolution image itself -- same naming-convention approach as
+    ui/image_viewer.py::ImageEditDialog's own "<name>.original<ext>" pre-edit backup, so a fresh
+    schema column/migration isn't needed for either. Pure pathlib -- no cv2/Qt dependency -- so
+    both ui/ (which generates and reads the cache: see ui/frame_display.py::write_thumbnail_cache
+    and ui/main_window.py::_load_thumbnail) and storage/retention.py (which only ever needs the
+    path, to delete it alongside the full image) can share one definition of the convention without
+    storage/ having to depend on ui/.
+    """
+    path = Path(image_path)
+    return path.with_name(f"{path.stem}.thumb.jpg")
+
+
 @dataclass
 class ScanRecord:
     """One row of the scans table, as read back from the database."""
@@ -318,10 +332,40 @@ def insert_flagged_person(
     return cursor.lastrowid
 
 
+def update_flagged_person(
+    conn: sqlite3.Connection,
+    flagged_person_id: int,
+    name: str | None,
+    personal_number: str | None,
+    image_path: str | None,
+    notes: str | None,
+) -> None:
+    """Update every editable field of an existing flagged-persons watch-list entry in place -- created_at and id are untouched.
+
+    Changing name/personal_number here changes what document.flag_matcher.find_matching_flagged_person
+    considers a match against this entry, which can both stop matching scans currently flagged
+    against it and start matching ones that weren't before -- see
+    ui/flag_retroactive.py::apply_flagged_person_edit, the caller responsible for reconciling
+    already-flagged scans against whatever this update just changed. This function itself only
+    writes the row; it doesn't touch any scan's own flagged_match.
+    """
+    conn.execute(
+        "UPDATE flagged_persons SET name = ?, personal_number = ?, image_path = ?, notes = ? WHERE id = ?",
+        (name or None, personal_number or None, image_path or None, notes or None, flagged_person_id),
+    )
+    conn.commit()
+
+
 def list_flagged_persons(conn: sqlite3.Connection) -> list[FlaggedPerson]:
     """Fetch every flagged-persons entry, newest first -- small, fixed-size operator-maintained list, so no pagination."""
     rows = conn.execute("SELECT * FROM flagged_persons ORDER BY created_at DESC").fetchall()
     return [_row_to_flagged_person(row) for row in rows]
+
+
+def get_flagged_person_by_id(conn: sqlite3.Connection, flagged_person_id: int) -> FlaggedPerson | None:
+    """Fetch a single flagged-persons entry by id, or None if it no longer exists (e.g. removed from Settings between a scan being flagged and an operator later acting on that flag)."""
+    row = conn.execute("SELECT * FROM flagged_persons WHERE id = ?", (flagged_person_id,)).fetchone()
+    return _row_to_flagged_person(row) if row is not None else None
 
 
 def delete_flagged_person(conn: sqlite3.Connection, flagged_person_id: int) -> None:

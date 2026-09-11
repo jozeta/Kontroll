@@ -17,6 +17,7 @@ saved to disk.
 """
 
 import logging
+import sqlite3
 import statistics
 from typing import Callable
 
@@ -37,8 +38,11 @@ from document.barcode_parser import decode_pdf417_barcodes
 from document.card_detector import detect_and_crop_card
 from document.field_crosscheck import compute_barcode_ocr_overlap_ratio
 from document.ocr import extract_text
+from ui.window_geometry import restore_geometry, save_geometry
 
 logger = logging.getLogger(__name__)
+
+_WINDOW_GEOMETRY_SETTING_KEY = "barcode_calibration_window_geometry"
 
 _HISTOGRAM_BUCKET_COUNT = 20
 
@@ -104,16 +108,25 @@ class BarcodeCalibrationWindow(QWidget):
         self,
         camera_manager: CameraManager,
         on_apply_threshold: Callable[[float], None],
+        conn: sqlite3.Connection | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent, Qt.WindowType.Window)
         self.camera_manager = camera_manager
         self._on_apply_threshold = on_apply_threshold
+        self._conn = conn
         self._ratios: list[float] = []
 
         self.setWindowTitle("Barcode/OCR overlap calibration")
         self.resize(480, 480)
+        if conn is not None:
+            restore_geometry(conn, self, _WINDOW_GEOMETRY_SETTING_KEY)
         self._build_layout()
+
+    def closeEvent(self, event) -> None:
+        if self._conn is not None:
+            save_geometry(self._conn, self, _WINDOW_GEOMETRY_SETTING_KEY)
+        super().closeEvent(event)
 
     def _build_layout(self) -> None:
         layout = QVBoxLayout(self)

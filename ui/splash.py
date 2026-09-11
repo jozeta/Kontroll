@@ -14,7 +14,7 @@ _BACKGROUND_COLOR = QColor(30, 30, 40)
 def _build_background_pixmap() -> QPixmap:
     """Draw just the logo onto a solid background -- the title/version text is added as QLabel children instead (see build_splash_screen), not painted onto this pixmap.
 
-    Vector shapes (QPainter polygons, as ui/app_icon.py draws) need no font, but text drawn
+    Vector shapes (QPainter-drawn rects/ellipses, as ui/app_icon.py draws) need no font, but text drawn
     directly via QPainter.drawText onto a bare QPixmap depends on whatever font the current
     platform happens to have available at that call site -- a real risk on a fresh/minimal
     machine. Routing the text through ordinary QLabel widgets instead uses the exact same

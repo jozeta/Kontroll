@@ -8,6 +8,7 @@ saved to disk, so they never pollute the operator's actual scan history.
 """
 
 import logging
+import sqlite3
 import statistics
 from typing import Callable
 
@@ -25,12 +26,14 @@ from PyQt6.QtWidgets import (
 from insightface.app import FaceAnalysis
 
 from capture.camera_manager import CameraManager
-from config.settings import set_setting
 from face.detector import detect_faces
 from face.embedder import get_best_face_embedding
 from face.matcher import compute_cosine_similarity
+from ui.window_geometry import restore_geometry, save_geometry
 
 logger = logging.getLogger(__name__)
+
+_WINDOW_GEOMETRY_SETTING_KEY = "calibration_window_geometry"
 
 _HISTOGRAM_BUCKET_COUNT = 20
 
@@ -96,17 +99,26 @@ class CalibrationWindow(QWidget):
         camera_manager: CameraManager,
         face_analysis_app: FaceAnalysis,
         on_apply_threshold: Callable[[float], None],
+        conn: sqlite3.Connection | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent, Qt.WindowType.Window)
         self.camera_manager = camera_manager
         self.face_analysis_app = face_analysis_app
         self._on_apply_threshold = on_apply_threshold
+        self._conn = conn
         self._scores: list[float] = []
 
         self.setWindowTitle("Face match calibration")
         self.resize(480, 480)
+        if conn is not None:
+            restore_geometry(conn, self, _WINDOW_GEOMETRY_SETTING_KEY)
         self._build_layout()
+
+    def closeEvent(self, event) -> None:
+        if self._conn is not None:
+            save_geometry(self._conn, self, _WINDOW_GEOMETRY_SETTING_KEY)
+        super().closeEvent(event)
 
     def _build_layout(self) -> None:
         layout = QVBoxLayout(self)

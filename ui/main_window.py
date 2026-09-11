@@ -1,6 +1,7 @@
 """Single-screen PyQt6 window: two live camera previews, one capture button, and a scan history list."""
 
 import base64
+import html
 import json
 import logging
 import shutil
@@ -15,10 +16,12 @@ from typing import Callable
 import cv2
 import numpy as np
 from insightface.app import FaceAnalysis
-from PyQt6.QtCore import QByteArray, QDate, QObject, QPropertyAnimation, QSize, Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtCore import QByteArray, QDate, QObject, QPoint, QPropertyAnimation, QSize, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QCloseEvent,
     QColor,
+    QCursor,
+    QIcon,
     QKeySequence,
     QMouseEvent,
     QPixmap,
@@ -47,6 +50,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStyle,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
@@ -72,7 +76,7 @@ from document.field_crosscheck import (
     determine_validation_status,
 )
 from document.field_extraction import extract_document_fields
-from document.flag_matcher import FlagMatch, find_matching_flagged_person
+from document.flag_matcher import FlagMatch, find_matching_flagged_person, match_basis_label, matched_on_display
 from document.image_quality import (
     ImageQualityResult,
     assess_image_quality,
@@ -82,7 +86,7 @@ from document.image_quality import (
 from face.detector import detect_faces
 from face.embedder import get_best_face_embedding
 from face.matcher import MatchResult, match_faces
-from document.person_matcher import find_previous_scans
+from document.person_matcher import PersonIndex, build_person_index, find_previous_scans, find_previous_scans_indexed
 from storage.models import (
     FlaggedPerson,
     ScanRecord,
@@ -93,22 +97,31 @@ from storage.models import (
     delete_flagged_person,
     delete_scan,
     delete_scan_comment,
+    get_flagged_person_by_id,
     get_scan_by_id,
     insert_flagged_person,
     insert_scan,
     list_flagged_persons,
     list_scan_comments,
     list_scans,
+    thumbnail_cache_path,
     update_match_result,
     update_scan_analysis,
     update_scan_doc_fields,
 )
+from ui.app_icon import render_app_logo
 from ui.flag_icons import render_flag_icon
-from ui.flag_retroactive import run_retroactive_flag_check
-from ui.frame_display import bgr_frame_to_pixmap as _bgr_frame_to_pixmap, shrink_to_fit as _shrink_to_fit
+from ui.flag_retroactive import apply_flagged_person_edit, run_retroactive_flag_check
+from ui.frame_display import (
+    THUMBNAIL_SIZE,
+    bgr_frame_to_pixmap as _bgr_frame_to_pixmap,
+    shrink_to_fit as _shrink_to_fit,
+    write_thumbnail_cache,
+)
 from ui.image_viewer import ClickableThumbnailLabel
 from ui.scan_export import build_batch_report_html, build_scan_report_html
 from ui.settings_window import SettingsWindow
+from ui.window_geometry import restore_geometry, save_geometry
 
 # Each independently resolved (and auto-created if missing) via config.app_paths rather than a
 # path relative to this file's own location -- see that module for why (packaged-EXE safety) and
@@ -121,7 +134,7 @@ logger = logging.getLogger(__name__)
 
 _PREVIEW_INTERVAL_MS = 33  # ~30fps live preview polling
 _PREVIEW_SIZE = (320, 240)
-_THUMBNAIL_SIZE = (110, 82)
+_THUMBNAIL_SIZE = THUMBNAIL_SIZE  # re-exported under this module's existing private name -- see ui/frame_display.py
 
 # How long the camera-flash-style white overlay takes to fade back out after a capture -- see
 # _FlashCapableLabel.flash_white/MainWindow._flash_capture_previews. Short enough to read as a
@@ -140,6 +153,12 @@ _QUALITY_CHECK_INTERVAL_TICKS = 10
 # MainWindow._maybe_show_signal_lost. ~1 second's worth, so a single dropped tick (which happens
 # occasionally and harmlessly) doesn't flicker the warning on and off.
 _SIGNAL_LOST_TICK_THRESHOLD = round(1000 / _PREVIEW_INTERVAL_MS)
+
+# Colors for the small always-visible camera-status badge next to each preview headline -- see
+# MainWindow._set_camera_status_badge.
+_CAMERA_STATUS_LIVE_COLOR = "#2E7D32"
+_CAMERA_STATUS_RECONNECTING_COLOR = "#F9A825"
+_CAMERA_STATUS_LOST_COLOR = "#C62828"
 
 _OVERRIDE_CHOICES = ["Automatic", "Override: Match", "Override: No Match"]
 
@@ -183,17 +202,62 @@ def _format_timestamp(created_at: str) -> str:
 
 
 def _load_thumbnail(image_path: str | None) -> QPixmap | None:
-    """Load a saved scan image from disk and scale it down to thumbnail size for the history list."""
+    """Load a saved scan image's cached thumbnail from disk (generating it first if this is the first time) and scale it to thumbnail size for the history list.
+
+    storage.models.thumbnail_cache_path names a small "<name>.thumb.jpg" file kept alongside the
+    full-resolution image -- decoding that tiny file is far cheaper than decoding the full-
+    resolution original every time, which matters here since this runs on every single history row
+    built, including, on a large scan history, the potentially hundreds of rows
+    MainWindow._jump_to_scan's catch-up load builds in one go. MainWindow._finish_save_capture and
+    ImageEditDialog._on_apply_clicked both generate this cache eagerly (from the same in-memory
+    frame they're already writing to disk, no extra read needed) whenever an image is produced or
+    edited, so the fallback path below -- decoding the full image and writing the cache from that
+    -- is normally only ever hit once per scan, lazily backfilling scans captured before this cache
+    existed rather than needing a migration pass over old rows. That fallback decode itself uses
+    cv2.IMREAD_REDUCED_COLOR_2 (a real decode-time saving for a JPEG, built into libjpeg's own
+    DCT-based scaled decoding, not just a resize done after a full decode) -- halving each
+    dimension still comfortably exceeds _THUMBNAIL_SIZE for every resolution this app captures at
+    (640x480 and up -- see capture/camera_manager.py), so this never undershoots the target size.
+    """
     if not image_path or not Path(image_path).exists():
         return None
-    frame = cv2.imread(image_path)
+
+    cache_path = thumbnail_cache_path(image_path)
+    if cache_path.exists():
+        frame = cv2.imread(str(cache_path))
+    else:
+        frame = cv2.imread(image_path, cv2.IMREAD_REDUCED_COLOR_2)
+        if frame is not None:
+            write_thumbnail_cache(image_path, frame, _THUMBNAIL_SIZE[0], _THUMBNAIL_SIZE[1])
     if frame is None:
         return None
+
     frame = _shrink_to_fit(frame, _THUMBNAIL_SIZE[0], _THUMBNAIL_SIZE[1])
     pixmap = _bgr_frame_to_pixmap(frame)
     return pixmap.scaled(
         _THUMBNAIL_SIZE[0], _THUMBNAIL_SIZE[1], Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
     )
+
+
+def _delete_image_and_cache(image_path: str | None) -> int:
+    """Delete a saved scan image file and its cached thumbnail (see storage.models.thumbnail_cache_path), returning the total bytes freed.
+
+    Shared by HistoryRowWidget._on_delete_clicked and, in effect, mirrored by
+    storage/retention.py::_delete_image_file_if_present for the automatic/manual purge jobs -- the
+    only two places in the app that ever delete a saved scan's image files, so a thumbnail cache
+    file can never be orphaned behind an already-deleted full image.
+    """
+    freed_bytes = 0
+    if not image_path:
+        return freed_bytes
+    for path in (Path(image_path), thumbnail_cache_path(image_path)):
+        if path.exists():
+            # Sized before unlinking -- lets the caller adjust its cached storage-usage total by
+            # exactly this amount instead of re-walking the whole image directory tree (see
+            # MainWindow._add_to_cached_storage_bytes).
+            freed_bytes += path.stat().st_size
+            path.unlink()
+    return freed_bytes
 
 
 def _match_icon_text(match_result: str | None) -> str:
@@ -203,6 +267,110 @@ def _match_icon_text(match_result: str | None) -> str:
     if match_result in ("no_match", "override_no_match"):
         return "❌ NO MATCH"
     return "➖ N/A"
+
+
+_TOOLTIP_ACCENT_COLOR = "#90CAF9"  # a light, theme-agnostic blue for a tooltip's own title -- Qt tooltips always render on a fixed (not theme-following) background, so this doesn't need to react to light/dark mode the way in-window widgets do.
+
+
+_TOOLTIP_FONT_SIZE = "8pt"  # smaller than Qt's own default tooltip font -- these tooltips pack in several data rows, not a single short hint, so keeping them compact matters more than for an ordinary one-line tooltip.
+
+
+def _tooltip_html(title: str, rows: list[str], footnote: str | None = None) -> str:
+    """Build a small, consistently-styled rich-text tooltip: a colored title, a divider, one row per line, and an optional italic footnote below a blank line.
+
+    Shared by every hover tooltip in the history list (see _match_confidence_tooltip,
+    _flagged_match_tooltip) so they read as one consistent design rather than each rolling its own
+    ad hoc formatting -- Qt tooltips render basic HTML, so a bold/colored title and a rule read far
+    more like a purpose-built info panel than a plain wrapped line of text.
+    """
+    html_parts = [
+        f"<div style='font-size:{_TOOLTIP_FONT_SIZE};'>",
+        f"<b style='color:{_TOOLTIP_ACCENT_COLOR};'>{title}</b><hr>",
+        "<br>".join(rows),
+    ]
+    if footnote:
+        html_parts.append(f"<br><br><i>{footnote}</i>")
+    html_parts.append("</div>")
+    return "".join(html_parts)
+
+
+def _match_confidence_tooltip(conn: sqlite3.Connection, match_score: float | None, match_result: str | None) -> str:
+    """Build the hover-tooltip for a row's match_icon_label: the raw similarity score, whether the
+    result was automatic or an operator override, and the currently configured face-match
+    threshold for reference.
+
+    This detail used to sit as a permanent inline label next to the icon, crowding every single
+    row with a number that's only occasionally worth checking -- moved to a hover tooltip instead,
+    shown only when an operator actually wants it.
+
+    The threshold shown is *today's* setting (config.settings.get_face_match_threshold), not
+    necessarily whatever was active when this scan was actually captured -- recalibration
+    (ui/calibration_window.py) can change it afterward, so this is deliberately labeled as current/
+    reference-only rather than presented as if it explains this specific row's own stored
+    match_result.
+    """
+    if match_score is None:
+        return _tooltip_html(
+            "Face Match", ["No similarity score available -- a face wasn't detected in one of the two images."]
+        )
+
+    rows = [f"Similarity score: <b>{match_score:.3f}</b>"]
+
+    if match_result in ("override_match", "override_no_match"):
+        outcome = "Match" if match_result == "override_match" else "No match"
+        rows.append(f"Result: {outcome} (manually overridden)")
+    elif match_result in ("match", "no_match"):
+        outcome = "Match" if match_result == "match" else "No match"
+        rows.append(f"Result: {outcome} (automatic)")
+
+    threshold = get_face_match_threshold(conn)
+    margin = match_score - threshold
+    rows.append(f"Current threshold: {threshold:.3f} (score is {margin:+.3f} relative to it)")
+
+    return _tooltip_html("Face Match", rows, footnote="Threshold may have been changed since this scan was captured.")
+
+
+def _flagged_match_tooltip(conn: sqlite3.Connection, flagged_match: dict) -> str:
+    """Build the hover-tooltip for a flagged scan's red badge: the full flagged-persons watch-list
+    entry this scan matched (name, personal number, notes, when it was added) plus which of the
+    scan's own fields is what actually matched -- detail that used to spill into the badge's own
+    visible text, crowding it on every flagged row (see HistoryRowWidget._build_layout).
+
+    Looks up the *live* storage.models.FlaggedPerson row by id rather than only trusting the
+    smaller snapshot already stored in the scan's own flagged_match blob (name/matched_on/notes) --
+    the watch-list entry may have been edited since this scan was flagged (see
+    ui/flag_retroactive.py::apply_flagged_person_edit), and the tooltip should reflect its current
+    details, not whatever was true at match time. Falls back to the stored snapshot if the entry
+    has since been deleted -- shouldn't normally happen, since deleting an entry clears every
+    scan's flag against it (storage.models.clear_flagged_match_for_person), but a defensive
+    fallback costs nothing here.
+    """
+    flagged_person_id = flagged_match.get("flagged_person_id")
+    flagged_person = get_flagged_person_by_id(conn, flagged_person_id) if flagged_person_id is not None else None
+
+    name = flagged_person.name if flagged_person is not None else flagged_match.get("flagged_person_name")
+    personal_number = flagged_person.personal_number if flagged_person is not None else None
+    notes = flagged_person.notes if flagged_person is not None else flagged_match.get("notes")
+
+    rows = []
+    if name:
+        rows.append(f"Name: {html.escape(name)}")
+    if personal_number:
+        rows.append(f"Personal number: {html.escape(personal_number)}")
+
+    matched_on = flagged_match.get("matched_on")
+    if matched_on:
+        rows.append(f"Matched via: {matched_on_display(matched_on).capitalize()}")
+    if flagged_person is not None:
+        rows.append(f"Watch-list match fields: {match_basis_label(flagged_person)}")
+    if notes:
+        rows.append(f"Notes: {html.escape(notes)}")
+    if flagged_person is not None and flagged_person.created_at:
+        rows.append(f"Added to watch list: {_format_timestamp(flagged_person.created_at)}")
+    if not rows:
+        rows.append("No further details recorded.")
+
+    return _tooltip_html("Flagged Person Match", rows, footnote="Manage this entry from Settings → Flagged Users.")
 
 
 @dataclass
@@ -483,6 +651,10 @@ class _CaptureAnalysisWorker(QObject):
         self.finished.emit(analysis)
 
 
+_FLAG_PERSON_DIALOG_GEOMETRY_KEY = "flag_person_dialog_geometry"
+_EDIT_FIELDS_DIALOG_GEOMETRY_KEY = "edit_fields_dialog_geometry"
+
+
 class _FlagPersonDialog(QDialog):
     """Prompt to add a scan's person to the operator-maintained flagged-persons watch list, prefilled from the scan's own extracted fields.
 
@@ -501,12 +673,14 @@ class _FlagPersonDialog(QDialog):
         suggested_personal_number: str,
         has_face_image: bool,
         has_doc_image: bool,
+        conn: sqlite3.Connection,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Add to Flagged Users")
         self._has_face_image = has_face_image
         self._has_doc_image = has_doc_image
+        self.finished.connect(lambda _result: save_geometry(conn, self, _FLAG_PERSON_DIALOG_GEOMETRY_KEY))
 
         form = QFormLayout(self)
 
@@ -536,6 +710,8 @@ class _FlagPersonDialog(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
+
+        restore_geometry(conn, self, _FLAG_PERSON_DIALOG_GEOMETRY_KEY)
 
     def _add_checkable_row(self, form: QFormLayout, label_text: str, initial_text: str) -> tuple[QCheckBox, QLineEdit]:
         """Add a form row of [checkbox][line edit], the edit starting disabled and only enabled while its checkbox is checked. Checking a row with prefilled text checks the box by default."""
@@ -572,9 +748,12 @@ class _EditFieldsDialog(QDialog):
     write through whatever's currently in the box.
     """
 
-    def __init__(self, given_name: str, surname: str, personal_number: str, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, given_name: str, surname: str, personal_number: str, conn: sqlite3.Connection, parent: QWidget | None = None
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Edit Name / Personal Number")
+        self.finished.connect(lambda _result: save_geometry(conn, self, _EDIT_FIELDS_DIALOG_GEOMETRY_KEY))
 
         form = QFormLayout(self)
         self.given_name_edit = QLineEdit(given_name)
@@ -589,9 +768,167 @@ class _EditFieldsDialog(QDialog):
         buttons.rejected.connect(self.reject)
         form.addRow(buttons)
 
+        restore_geometry(conn, self, _EDIT_FIELDS_DIALOG_GEOMETRY_KEY)
+
     def values(self) -> tuple[str, str, str]:
         """Return (given_name, surname, personal_number) once the dialog has been accepted."""
         return self.given_name_edit.text().strip(), self.surname_edit.text().strip(), self.personal_number_edit.text().strip()
+
+
+_SIDE_BY_SIDE_DIALOG_GEOMETRY_KEY = "side_by_side_dialog_geometry"
+_SIDE_BY_SIDE_MIN_IMAGE_SIZE = 120
+# Rough allowance for everything in the dialog besides the two images themselves -- the title
+# labels' own row, and the layout's outer margins/inter-column spacing. Doesn't need to be exact:
+# it only sets how tightly the window's size cap (see _constrain_window_size) hugs the images: a
+# little slack just leaves a few harmless extra pixels of gray, not a functional problem.
+_SIDE_BY_SIDE_CHROME_ALLOWANCE_PX = 56
+# Available-screen-size fraction used to cap how big this dialog can ever get for a very
+# high-resolution capture or a very wide document capture -- without this, e.g. two 4K images side
+# by side would demand a window bigger than most screens.
+_SIDE_BY_SIDE_MAX_SCREEN_FRACTION = 0.85
+
+
+class _AspectRatioImageLabel(QLabel):
+    """A QLabel that keeps a stored source pixmap rescaled to fill as much of its own current size
+    as possible (preserving aspect ratio), redone on every resize -- used by
+    _SideBySideImageDialog so its two images grow/shrink with the dialog window instead of staying
+    fixed at whatever size they were first drawn at.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._source_pixmap: QPixmap | None = None
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(_SIDE_BY_SIDE_MIN_IMAGE_SIZE, _SIDE_BY_SIDE_MIN_IMAGE_SIZE)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+    def set_source_pixmap(self, pixmap: QPixmap) -> None:
+        self._source_pixmap = pixmap
+        self._rescale()
+
+    def resizeEvent(self, event: QResizeEvent | None) -> None:
+        super().resizeEvent(event)
+        self._rescale()
+
+    def _rescale(self) -> None:
+        if self._source_pixmap is None or self._source_pixmap.isNull():
+            return
+        self.setPixmap(
+            self._source_pixmap.scaled(
+                self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+            )
+        )
+
+
+class _SideBySideImageDialog(QDialog):
+    """A quick-glance comparison view of a scan's live face capture and document capture side by
+    side, opened via the small "⇄" compare button between the two thumbnails in HistoryRowWidget's
+    summary row. Deliberately static (no zoom/pan/crop) -- that's already available by double-
+    clicking either thumbnail individually (see ui/image_viewer.py::ImageViewerWindow).
+
+    Each title stays pinned to the top of its column (fixed height, no stretch) while its image
+    label takes stretch=1 and _AspectRatioImageLabel's own resizeEvent keeps it rescaled to fill
+    whatever space that leaves -- so shrinking this window (see _constrain_window_size for why it
+    can only shrink, never grow past the images' own native size) still scales the images down
+    smoothly rather than just clipping them.
+    """
+
+    def __init__(
+        self, face_image_path: str | None, doc_image_path: str | None, conn: sqlite3.Connection, parent: QWidget | None = None
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Compare Face and Document")
+        self._conn = conn
+        self.finished.connect(lambda _result: save_geometry(self._conn, self, _SIDE_BY_SIDE_DIALOG_GEOMETRY_KEY))
+
+        layout = QHBoxLayout(self)
+        face_column, face_pixmap = self._build_image_column("Live Face Capture", face_image_path)
+        doc_column, doc_pixmap = self._build_image_column("Document Capture", doc_image_path)
+        layout.addLayout(face_column)
+        layout.addLayout(doc_column)
+
+        self._constrain_window_size(face_pixmap, doc_pixmap)
+        restore_geometry(conn, self, _SIDE_BY_SIDE_DIALOG_GEOMETRY_KEY)
+
+    def _build_image_column(self, title: str, image_path: str | None) -> tuple[QVBoxLayout, QPixmap | None]:
+        column = QVBoxLayout()
+        title_label = QLabel(f"<b>{title}</b>")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        column.addWidget(title_label)  # no stretch -- stays pinned to the top of the column
+
+        image_label = _AspectRatioImageLabel()
+        pixmap = QPixmap(image_path) if image_path and Path(image_path).exists() else None
+        if pixmap is not None and not pixmap.isNull():
+            image_label.set_source_pixmap(pixmap)
+        else:
+            image_label.setText("No image")
+            pixmap = None
+        column.addWidget(image_label, stretch=1)  # absorbs all remaining vertical space
+        return column, pixmap
+
+    def _constrain_window_size(self, face_pixmap: QPixmap | None, doc_pixmap: QPixmap | None) -> None:
+        """Cap the window at roughly the combined size of both images shown at their own native
+        resolution (never smaller than a modest per-image minimum), and open at that size by
+        default -- growing this window bigger than that would only ever add empty gray space
+        around already-full-resolution images, never reveal more real detail, which is exactly the
+        excess gray space reported around a dialog left at its old fixed initial size regardless of
+        how small the actual images were. Still freely shrinkable below the cap (image labels
+        rescale down via _AspectRatioImageLabel), just not growable past it.
+        """
+        screen = self.screen() or QApplication.primaryScreen()
+        available = screen.availableGeometry() if screen is not None else None
+        max_screen_height = int(available.height() * _SIDE_BY_SIDE_MAX_SCREEN_FRACTION) if available is not None else 900
+        max_screen_width = int(available.width() * _SIDE_BY_SIDE_MAX_SCREEN_FRACTION) if available is not None else 1400
+
+        def total_width_at_height(image_height: int) -> int:
+            def width_at(pixmap: QPixmap | None) -> int:
+                if pixmap is None or pixmap.isNull() or pixmap.height() <= 0:
+                    return _SIDE_BY_SIDE_MIN_IMAGE_SIZE
+                return round(pixmap.width() * (image_height / pixmap.height()))
+
+            return width_at(face_pixmap) + width_at(doc_pixmap)
+
+        native_height = max(
+            (face_pixmap.height() if face_pixmap is not None else 0),
+            (doc_pixmap.height() if doc_pixmap is not None else 0),
+            _SIDE_BY_SIDE_MIN_IMAGE_SIZE,
+        )
+        target_image_height = min(native_height, max_screen_height)
+
+        # A very wide document capture (e.g. a light-box shot with the card occupying only a
+        # fraction of the frame) can demand a combined width well past the screen even at a modest
+        # shared height -- shrink the shared height further, proportionally, until the combined
+        # width fits too, rather than only ever capping height.
+        max_content_width = max_screen_width - _SIDE_BY_SIDE_CHROME_ALLOWANCE_PX
+        combined_width = total_width_at_height(target_image_height)
+        if combined_width > max_content_width and combined_width > 0:
+            target_image_height = max(1, round(target_image_height * (max_content_width / combined_width)))
+
+        window_width = total_width_at_height(target_image_height) + _SIDE_BY_SIDE_CHROME_ALLOWANCE_PX
+        window_height = target_image_height + _SIDE_BY_SIDE_CHROME_ALLOWANCE_PX
+
+        self.setMaximumSize(window_width, window_height)
+        self.resize(window_width, window_height)
+
+
+class _InstantTooltipLabel(QLabel):
+    """A QLabel whose tooltip (see setToolTip) appears the instant the cursor enters it, instead of after Qt's own default hover delay (QStyle.StyleHint.SH_ToolTip_WakeUpDelay, commonly ~700ms).
+
+    Used for the match-confidence and flagged-person badges (see HistoryRowWidget._build_layout):
+    both moved a detail panel that used to be permanent inline text into a hover tooltip, so a
+    real delay before that tooltip appears works against the whole point of it being there --
+    unlike an ordinary tooltip that's just a supplementary hint, this one *is* the feature.
+    """
+
+    def enterEvent(self, event) -> None:
+        super().enterEvent(event)
+        tooltip_text = self.toolTip()
+        if tooltip_text:
+            QToolTip.showText(QCursor.pos(), tooltip_text, self)
+
+    def leaveEvent(self, event) -> None:
+        super().leaveEvent(event)
+        QToolTip.hideText()
 
 
 class HistoryRowWidget(QFrame):
@@ -609,6 +946,7 @@ class HistoryRowWidget(QFrame):
         on_export: Callable[[ScanRecord, list[ScanRecord]], None] | None = None,
         on_selection_toggled: Callable[[ScanRecord, bool], None] | None = None,
         all_scans: list[ScanRecord] | None = None,
+        person_index: PersonIndex | None = None,
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -635,7 +973,7 @@ class HistoryRowWidget(QFrame):
         # cached one, since it has to run before a scan's row (and this cache) even exists -- see
         # that method's own docstring.
         self.display_fields = _derive_display_fields(self.scan.doc_fields_json)
-        self._previous_scans_cache = self._compute_previous_scans(all_scans)
+        self._previous_scans_cache = self._compute_previous_scans(all_scans, person_index)
         self._build_layout()
         self._apply_flagged_row_style()
 
@@ -655,21 +993,28 @@ class HistoryRowWidget(QFrame):
         position = next(index for index, scan in enumerate(all_visits, start=1) if scan.id == self.scan.id)
         return position, len(all_visits)
 
-    def _compute_previous_scans(self, all_scans: list[ScanRecord] | None) -> list[ScanRecord]:
+    def _compute_previous_scans(
+        self, all_scans: list[ScanRecord] | None, person_index: PersonIndex | None = None
+    ) -> list[ScanRecord]:
         """Find every other saved scan that represents the same person as this one, newest first -- see document/person_matcher.py. Computed once at row build time and cached, since it's read both for the summary row's visit-count badge and the detail section's visit history.
 
-        all_scans, if given, is the full scan list a caller building many rows at once (e.g.
-        MainWindow._load_history) already fetched -- reusing it here avoids each of those rows
-        independently re-running its own full-table `list_scans(limit=100_000)` query, which
-        turned every history load into O(n) redundant full-table scans for n displayed rows. A
-        caller adding just one new row (e.g. after a fresh capture) can omit it; the one query that
-        costs is no longer a hot loop when it only happens once.
+        person_index, if given, is a PersonIndex built once by the caller (e.g.
+        MainWindow._load_history) over every saved scan -- an O(1)-average lookup instead of the
+        O(N) linear scan find_previous_scans does over all_scans, which is what turned jumping to
+        an old visit (MainWindow._jump_to_scan, which must synchronously build every row between
+        the top of the list and the target) into an effectively O(N^2) UI-thread freeze on a large
+        production scan history. Falls back to all_scans (a caller-supplied full scan list, reused
+        to avoid each row independently re-running its own full-table query -- see the older
+        docstring this replaced) when no index is given, e.g. the single fresh-capture insert path
+        where building a whole index for just one row isn't worth it.
         """
         if not self.scan.doc_fields_json:
             return []
         doc_fields = json.loads(self.scan.doc_fields_json)
         if not doc_fields:
             return []
+        if person_index is not None:
+            return find_previous_scans_indexed(doc_fields, person_index, exclude_scan_id=self.scan.id)
         scans = all_scans if all_scans is not None else list_scans(self.conn, limit=100_000)
         return find_previous_scans(doc_fields, scans, exclude_scan_id=self.scan.id)
 
@@ -685,6 +1030,7 @@ class HistoryRowWidget(QFrame):
         summary_row.addWidget(self.export_selection_checkbox)
 
         summary_row.addWidget(self._build_thumbnail(self.scan.face_image_path, "Live Face Capture", kind="face"))
+        summary_row.addWidget(self._build_compare_button())
         summary_row.addWidget(self._build_doc_thumbnail_column())
 
         display_fields = self.display_fields
@@ -697,8 +1043,14 @@ class HistoryRowWidget(QFrame):
         summary_row.addLayout(identity_column, stretch=1)
         summary_row.addSpacing(32)
 
-        self.match_icon_label = QLabel(_match_icon_text(self.scan.match_result))
+        self.match_icon_label = _InstantTooltipLabel(_match_icon_text(self.scan.match_result))
         self.match_icon_label.setStyleSheet("font-size: 16pt; font-weight: bold;")
+        # The raw similarity score, whether the result was automatic or an operator override, and
+        # the current face-match threshold for reference are all in the hover tooltip rather than
+        # a permanent inline label next to the icon -- that used to crowd every single row with a
+        # number that's only occasionally worth checking; a tooltip surfaces it exactly when an
+        # operator actually wants it, on demand, without it competing for space on every row.
+        self.match_icon_label.setToolTip(_match_confidence_tooltip(self.conn, self.scan.match_score, self.scan.match_result))
         summary_row.addWidget(self.match_icon_label)
 
         self.status_label = QLabel(f"Doc: {(self.scan.validation_status or '-').upper()}")
@@ -715,7 +1067,12 @@ class HistoryRowWidget(QFrame):
         flagged_match = self._flagged_match_info()
         if flagged_match is not None:
             flagged_reason = flagged_match.get("notes") or flagged_match.get("flagged_person_name") or "Flagged person"
-            self.flagged_match_label = QLabel(f"🚩 FLAGGED: {flagged_reason}")
+            # Just the icon and reason -- name, personal number, which field matched, and when the
+            # entry was added to the watch list all moved into the hover tooltip instead (see
+            # _flagged_match_tooltip) rather than crowding the badge's own visible text with a
+            # "(matched by ...)" suffix on every flagged row.
+            self.flagged_match_label = _InstantTooltipLabel(f"🚩 {flagged_reason}")
+            self.flagged_match_label.setToolTip(_flagged_match_tooltip(self.conn, flagged_match))
             self.flagged_match_label.setStyleSheet(
                 "color: white; background-color: #B71C1C; font-weight: bold; padding: 2px 6px; border-radius: 3px;"
             )
@@ -840,6 +1197,20 @@ class HistoryRowWidget(QFrame):
             return None
         return f"Low quality ({quality.get('text', 'unknown')})"
 
+    def _build_compare_button(self) -> QWidget:
+        """A small icon button between the two thumbnails that opens both saved images side by side (see _SideBySideImageDialog) -- a quicker glance than double-clicking each thumbnail individually and mentally flipping between two separate viewer windows."""
+        button = QPushButton("⇄")
+        button.setFixedSize(18, 18)
+        button.setToolTip("Compare face and document side by side")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setStyleSheet("QPushButton { font-size: 9pt; padding: 0; }")
+        button.clicked.connect(self._on_compare_clicked)
+        return button
+
+    def _on_compare_clicked(self) -> None:
+        dialog = _SideBySideImageDialog(self.scan.face_image_path, self.scan.doc_image_path, self.conn, parent=self)
+        dialog.exec()
+
     def _build_thumbnail(self, image_path: str | None, title: str, kind: str | None = None) -> QLabel:
         """Build a fixed-size thumbnail label for one of the row's two saved images. Double-clicking it opens the full image in a resizable viewer window, auto-zoomed to the detected face/card region when kind is given, with an "Edit image…" (crop/brightness/contrast, then optional re-analyze) action -- see ui/image_viewer.py."""
         label = ClickableThumbnailLabel(
@@ -849,6 +1220,7 @@ class HistoryRowWidget(QFrame):
             face_analysis_app=self.face_analysis_app,
             scan=self.scan,
             on_reanalyze=self._on_reanalyze,
+            conn=self.conn,
         )
         label.setFixedSize(*_THUMBNAIL_SIZE)
         pixmap = _load_thumbnail(image_path)
@@ -1052,10 +1424,20 @@ class HistoryRowWidget(QFrame):
         self._refresh_comments_list()
 
     def _on_edit_fields_clicked(self) -> None:
-        """Open a dialog to manually correct this scan's given name/surname/personal number, for when OCR/MRZ/barcode extraction got a field wrong or missed it entirely -- without needing a full re-capture."""
+        """Open a dialog to manually correct this scan's given name/surname/personal number, for when OCR/MRZ/barcode extraction got a field wrong or missed it entirely -- without needing a full re-capture.
+
+        If this scan is currently flagged, also propagates a corrected name/personal number into
+        the linked flagged-persons watch-list entry (see _sync_flagged_person_from_edit) -- an
+        operator correcting a flagged visitor's misread name here would otherwise leave the master
+        watch-list entry (and thus future matching) still using the old, wrong value.
+        """
         doc_fields = json.loads(self.scan.doc_fields_json) if self.scan.doc_fields_json else {}
         dialog = _EditFieldsDialog(
-            doc_fields.get("name", ""), doc_fields.get("surname", ""), doc_fields.get("personal_number", ""), parent=self
+            doc_fields.get("name", ""),
+            doc_fields.get("surname", ""),
+            doc_fields.get("personal_number", ""),
+            conn=self.conn,
+            parent=self,
         )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -1072,12 +1454,38 @@ class HistoryRowWidget(QFrame):
         self.scan.doc_fields_json = doc_fields_json
         logger.info("Operator manually edited name/personal-number fields for scan %d", self.scan.id)
 
+        self._sync_flagged_person_from_edit(f"{given_name} {surname}".strip(), personal_number)
+
         if self._on_flagged_persons_changed is not None:
             # Reuses the same "refresh everything" callback flag changes use -- editing a name/
             # personal number can change which other scans this one's visit history/count (see
             # document/person_matcher.py) or watch-list match reflects, not just this row's own
             # display, so a full history reload is needed here too.
             self._on_flagged_persons_changed()
+
+    def _sync_flagged_person_from_edit(self, corrected_name: str, corrected_personal_number: str) -> None:
+        """If this scan is currently flagged, propagate a corrected name/personal number into the linked flagged-persons entry via ui/flag_retroactive.py::apply_flagged_person_edit -- the same shared apply path Settings' own Edit button uses, so a change here still warns first if it would unflag some other scan matching the watch-list entry's *old* details. A no-op if nothing relevant actually changed, or if the linked entry was since removed from the watch list."""
+        flagged_match = self._flagged_match_info()
+        if flagged_match is None or flagged_match.get("flagged_person_id") is None:
+            return
+        flagged_person = get_flagged_person_by_id(self.conn, flagged_match["flagged_person_id"])
+        if flagged_person is None:
+            return
+
+        name_changed = bool(corrected_name) and corrected_name != (flagged_person.name or "")
+        number_changed = bool(corrected_personal_number) and corrected_personal_number != (flagged_person.personal_number or "")
+        if not (name_changed or number_changed):
+            return
+
+        apply_flagged_person_edit(
+            self.conn,
+            flagged_person,
+            corrected_name or flagged_person.name,
+            corrected_personal_number or flagged_person.personal_number,
+            flagged_person.notes,
+            flagged_person.image_path,
+            self,
+        )
 
     def _on_reanalyze_clicked(self) -> None:
         if self._on_reanalyze is not None:
@@ -1093,7 +1501,9 @@ class HistoryRowWidget(QFrame):
         has_face_image = bool(self.scan.face_image_path and Path(self.scan.face_image_path).exists())
         has_doc_image = bool(self.scan.doc_image_path and Path(self.scan.doc_image_path).exists())
 
-        dialog = _FlagPersonDialog(suggested_name, suggested_personal_number, has_face_image, has_doc_image, parent=self)
+        dialog = _FlagPersonDialog(
+            suggested_name, suggested_personal_number, has_face_image, has_doc_image, conn=self.conn, parent=self
+        )
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
@@ -1182,6 +1592,7 @@ class HistoryRowWidget(QFrame):
         logger.info("Operator overrode scan %d match_result to '%s'", self.scan.id, new_label)
         self.scan.match_result = new_label
         self.match_icon_label.setText(_match_icon_text(new_label))
+        self.match_icon_label.setToolTip(_match_confidence_tooltip(self.conn, self.scan.match_score, new_label))
 
     def _on_export_clicked(self) -> None:
         """Delegate to MainWindow._on_export_scan_requested, passing along this scan's already-computed previous-visits cache -- MainWindow owns the actual file-save dialog and (if the operator has previous visits and opts in) bundling them into one combined report, since that's shared with the checkbox-driven batch export below."""
@@ -1207,12 +1618,7 @@ class HistoryRowWidget(QFrame):
         delete_scan(self.conn, self.scan.id)
         freed_bytes = 0
         for image_path in (self.scan.face_image_path, self.scan.doc_image_path):
-            if image_path and Path(image_path).exists():
-                # Sized before unlinking -- lets the caller adjust its cached storage-usage total
-                # by exactly this amount instead of re-walking the whole image directory tree (see
-                # MainWindow._add_to_cached_storage_bytes).
-                freed_bytes += Path(image_path).stat().st_size
-                Path(image_path).unlink()
+            freed_bytes += _delete_image_and_cache(image_path)
         logger.info("Operator deleted scan %d", self.scan.id)
 
         if self._on_delete is not None:
@@ -1404,6 +1810,11 @@ class MainWindow(QMainWindow):
         face_analysis_app: FaceAnalysis,
     ) -> None:
         super().__init__()
+        # QApplication.setWindowIcon (main.py) already supplies this as the default for every
+        # window that doesn't set its own -- set explicitly here too since Windows' title-bar icon
+        # specifically (as opposed to the taskbar/Alt-Tab icon) doesn't always reliably pick up
+        # that application-wide default for every top-level window.
+        self.setWindowIcon(QIcon(render_app_logo(64)))
         self.conn = conn
         self.camera_manager = camera_manager
         self.face_analysis_app = face_analysis_app
@@ -1483,6 +1894,12 @@ class MainWindow(QMainWindow):
         # Settings (General tab) takes effect immediately (see
         # SettingsWindow._on_save_history_page_size_clicked's on_data_changed callback).
         self._all_scans: list[ScanRecord] = []
+        # Rebuilt (see _rebuild_person_index) every time self._all_scans changes -- an O(1)-average
+        # same-person lookup shared by every row, instead of each row's own O(N) scan over the full
+        # list. See document/person_matcher.py::PersonIndex for why this exists: reaching an old
+        # visit via _jump_to_scan used to mean building thousands of rows on a large production
+        # history, each doing its own full-list scan -- effectively O(N^2) on the UI thread.
+        self._person_index: PersonIndex | None = None
         self._filtered_scans: list[ScanRecord] = []
         self._loaded_count: int = 0
         self._history_page_size: int = get_history_page_size(self.conn)
@@ -1535,8 +1952,10 @@ class MainWindow(QMainWindow):
         self.doc_preview_label = self._build_preview_label(_QualityOverlayLabel)
         self.doc_quality_warning_label = self._build_quality_warning_label()
         self.doc_preview_label.set_quality_overlay(self.doc_quality_warning_label)
-        previews_row.addLayout(self._build_preview_column("Visitor", self.face_preview_label), stretch=1)
-        previews_row.addLayout(self._build_preview_column("Identification", self.doc_preview_label), stretch=1)
+        face_column, self.face_status_badge = self._build_preview_column("Visitor", self.face_preview_label)
+        doc_column, self.doc_status_badge = self._build_preview_column("Identification", self.doc_preview_label)
+        previews_row.addLayout(face_column, stretch=1)
+        previews_row.addLayout(doc_column, stretch=1)
         top_layout.addLayout(previews_row, stretch=1)
 
         capture_row = QHBoxLayout()
@@ -1932,10 +2351,12 @@ class MainWindow(QMainWindow):
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return label
 
-    def _build_preview_column(self, headline_text: str, preview_label: QLabel) -> QVBoxLayout:
-        """Stack a centered, bold, white headline above one camera preview label."""
+    def _build_preview_column(self, headline_text: str, preview_label: QLabel) -> tuple[QVBoxLayout, QLabel]:
+        """Stack a centered, bold headline (with a small always-visible camera-status badge beside it) above one camera preview label. Returns the column layout and the status badge label -- kept updated every preview tick by _set_camera_status_badge, called from _update_previews alongside its existing signal-lost-streak bookkeeping."""
         column = QVBoxLayout()
 
+        headline_row = QHBoxLayout()
+        headline_row.addStretch(1)
         headline = QLabel(headline_text)
         headline.setAlignment(Qt.AlignmentFlag.AlignCenter)
         # Deliberately no hardcoded color here -- leaving it unset lets the label inherit the
@@ -1944,10 +2365,15 @@ class MainWindow(QMainWindow):
         # hardcoded "color: white" (the previous approach, unreadable under a light theme since
         # this label sits directly on the window background with no fixed backdrop).
         headline.setStyleSheet("font-size: 16pt; font-weight: bold;")
-        column.addWidget(headline)
+        headline_row.addWidget(headline)
+        status_badge = QLabel()
+        status_badge.setStyleSheet("font-size: 9pt; font-weight: bold; margin-left: 6px;")
+        headline_row.addWidget(status_badge)
+        headline_row.addStretch(1)
+        column.addLayout(headline_row)
         column.addWidget(preview_label, stretch=1)
 
-        return column
+        return column, status_badge
 
     def _build_quality_warning_label(self) -> QLabel:
         """Build the (initially hidden) semi-transparent banner overlaid on top of the live document preview when the camera frame looks too low-resolution or too blurry for reliable OCR -- see _update_doc_quality_warning.
@@ -1981,9 +2407,14 @@ class MainWindow(QMainWindow):
         takes effect on the next reload without needing a restart.
         """
         self._all_scans = list_scans(self.conn, limit=100_000)
+        self._rebuild_person_index()
         self._history_page_size = get_history_page_size(self.conn)
         self._recompute_filtered_scans()
         self._reset_loaded_rows()
+
+    def _rebuild_person_index(self) -> None:
+        """Rebuild self._person_index from self._all_scans -- call after any mutation of self._all_scans (a full reload, a fresh capture inserted, a scan deleted, a re-analysis changing a scan's own fields) so every row's cheap indexed previous-visit lookup stays in sync with what's actually loaded. See self._person_index's own comment for why this exists."""
+        self._person_index = build_person_index(self._all_scans)
 
     def _build_history_row(self, scan: ScanRecord, all_scans: list[ScanRecord] | None) -> HistoryRowWidget:
         """Construct one HistoryRowWidget with every standard callback wired up -- shared by _add_history_row (a brand new row) and _replace_history_row (rebuilding an existing row in place), so the two can never drift apart in which callbacks they pass."""
@@ -1998,6 +2429,7 @@ class MainWindow(QMainWindow):
             on_export=self._on_export_scan_requested,
             on_selection_toggled=self._on_history_row_selection_toggled,
             all_scans=all_scans,
+            person_index=self._person_index,
         )
 
     def _add_history_row(self, scan: ScanRecord, all_scans: list[ScanRecord] | None = None) -> None:
@@ -2052,16 +2484,19 @@ class MainWindow(QMainWindow):
         for stale_row in [row for row in self._history_rows if row.scan.id in same_person_ids]:
             self._replace_history_row(stale_row, all_scans)
 
-    def _replace_history_row(self, old_row: HistoryRowWidget, all_scans: list[ScanRecord]) -> None:
-        """Swap one already-displayed HistoryRowWidget for a freshly-built one at the same position in the list, e.g. to pick up a visit-count change -- see _refresh_same_person_rows."""
+    def _replace_history_row(
+        self, old_row: HistoryRowWidget, all_scans: list[ScanRecord], scan: ScanRecord | None = None
+    ) -> HistoryRowWidget:
+        """Swap one already-displayed HistoryRowWidget for a freshly-built one at the same position in the list, e.g. to pick up a visit-count change -- see _refresh_same_person_rows. `scan`, if given, replaces old_row's own (stale) scan record -- e.g. _finish_reanalyze, where the underlying record itself changed, not just some other row's view of it -- otherwise old_row.scan is reused unchanged."""
         layout_index = self.history_layout.indexOf(old_row)
         self.history_layout.removeWidget(old_row)
         old_row.setParent(None)
         old_row.deleteLater()
 
-        new_row = self._build_history_row(old_row.scan, all_scans)
+        new_row = self._build_history_row(scan if scan is not None else old_row.scan, all_scans)
         self.history_layout.insertWidget(layout_index, new_row)
         self._history_rows[self._history_rows.index(old_row)] = new_row
+        return new_row
 
     def _on_history_row_selection_toggled(self, scan: ScanRecord, checked: bool) -> None:
         """Track/untrack one scan's id in the batch-export selection as its row checkbox is toggled, and refresh the Export selected button's count/enabled state."""
@@ -2251,7 +2686,32 @@ class MainWindow(QMainWindow):
             if previous_doc_fields.get(field_name) != analysis.doc_fields.get(field_name)
         ]
 
-        self._reload_history()
+        # Replace just this one row in place rather than a full _reload_history() -- a full reload
+        # tears down and rebuilds the whole list from the front, which reset the scroll position
+        # back up near the top (a real reported annoyance, the same class of bug already fixed for
+        # deletion -- see _on_history_row_deleted's own docstring). Mirrors that same targeted
+        # in-place-update pattern: refresh self._all_scans/_person_index for the changed record,
+        # swap just this row (and any other same-person rows whose visit-history/badge might now
+        # differ), then keep the operator's eye on it via the same center+flash used by a
+        # previous-visit jump.
+        updated_scan = get_scan_by_id(self.conn, scan.id)
+        for index, existing_scan in enumerate(self._all_scans):
+            if existing_scan.id == updated_scan.id:
+                self._all_scans[index] = updated_scan
+                break
+        self._rebuild_person_index()
+        self._recompute_filtered_scans()
+
+        old_row = next((row for row in self._history_rows if row.scan.id == updated_scan.id), None)
+        if old_row is not None:
+            was_expanded = old_row.detail_toggle.isChecked()
+            new_row = self._replace_history_row(old_row, self._all_scans, scan=updated_scan)
+            self._refresh_same_person_rows(updated_scan, self._all_scans)
+            new_row.detail_toggle.setChecked(True if changed_summary else was_expanded)
+            self._center_row_in_history_view(new_row)
+            self._flash_row(new_row)
+        self._update_history_status_label()
+
         if changed_summary:
             QMessageBox.information(self, "Re-analyze scan", "Fields updated:\n" + "\n".join(changed_summary))
         else:
@@ -2274,14 +2734,37 @@ class MainWindow(QMainWindow):
         target_index = next((i for i, scan in enumerate(self._filtered_scans) if scan.id == scan_id), None)
         if target_index is None:
             return
-        while self._loaded_count <= target_index and self._loaded_count < len(self._filtered_scans):
-            self._load_more_rows()
+
+        # Reaching an old visit can mean synchronously building hundreds/thousands of rows on a
+        # large production history (each _load_more_rows call is itself cheap, but there can be
+        # many of them) -- a wait cursor plus periodic processEvents() keeps the app visibly
+        # responsive during that catch-up instead of looking like the click did nothing (the
+        # original, silently-frozen version of this loop is what a large production scan history
+        # made look completely broken -- see document/person_matcher.py::PersonIndex for the other
+        # half of this fix, which makes each individual row cheap to build in the first place).
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            while self._loaded_count <= target_index and self._loaded_count < len(self._filtered_scans):
+                self._load_more_rows()
+                QApplication.processEvents()
+        finally:
+            QApplication.restoreOverrideCursor()
+
         target_row = next((row for row in self._history_rows if row.scan.id == scan_id), None)
         if target_row is None:
             return
         target_row.detail_toggle.setChecked(True)
-        self.history_scroll_area.ensureWidgetVisible(target_row, 0, 60)
+        self._center_row_in_history_view(target_row)
         self._flash_row(target_row)
+
+    def _center_row_in_history_view(self, row: "HistoryRowWidget") -> None:
+        """Scroll history_scroll_area so `row`'s vertical midpoint lands in the middle of the visible viewport, rather than merely scrolling the minimum distance needed to bring it into view at all (what QScrollArea.ensureWidgetVisible does, and what previously left a jumped-to row sitting at the very edge of the viewport instead of clearly in focus)."""
+        container = self.history_scroll_area.widget()
+        row_center_y = row.mapTo(container, QPoint(0, row.height() // 2)).y()
+        scrollbar = self.history_scroll_area.verticalScrollBar()
+        viewport_height = self.history_scroll_area.viewport().height()
+        target = row_center_y - viewport_height // 2
+        scrollbar.setValue(max(0, min(target, scrollbar.maximum())))
 
     def _flash_row(self, row: "HistoryRowWidget") -> None:
         """Briefly outline a history row so the operator's eye is drawn to it right after a jump, then restore its normal styling (preserving whatever flagged/unflagged tint it already had)."""
@@ -2311,6 +2794,7 @@ class MainWindow(QMainWindow):
         """
         deleted_scan = row.scan
         self._all_scans = [scan for scan in self._all_scans if scan.id != deleted_scan.id]
+        self._rebuild_person_index()
         self._filtered_scans = [scan for scan in self._filtered_scans if scan.id != deleted_scan.id]
         if row in self._history_rows:
             self._history_rows.remove(row)
@@ -2335,6 +2819,9 @@ class MainWindow(QMainWindow):
             self._maybe_show_signal_lost(
                 self.face_preview_label, self._face_signal_lost_streak, self.camera_manager.face_capture.isOpened()
             )
+        self._set_camera_status_badge(
+            self.face_status_badge, self._face_signal_lost_streak, self.camera_manager.face_capture.isOpened()
+        )
 
         doc_frame = self.camera_manager.read_doc_preview_frame()
         if doc_frame is not None:
@@ -2353,6 +2840,9 @@ class MainWindow(QMainWindow):
             self._maybe_show_signal_lost(
                 self.doc_preview_label, self._doc_signal_lost_streak, self.camera_manager.doc_capture.isOpened()
             )
+        self._set_camera_status_badge(
+            self.doc_status_badge, self._doc_signal_lost_streak, self.camera_manager.doc_capture.isOpened()
+        )
 
         # Reuses this tick's own already-read frames rather than letting Settings do its own
         # independent capture.read() -- see SettingsWindow.update_camera_diagnostics' docstring
@@ -2472,6 +2962,29 @@ class MainWindow(QMainWindow):
             # frame reads successfully again, which clears this warning with no operator action.
             label.setText("⚠ Camera offline" if not camera_is_opened else "⚠ Camera signal lost — reconnecting...")
             label.setStyleSheet("color: #FF5252; font-weight: bold; font-size: 12pt;")
+
+    def _set_camera_status_badge(self, badge: QLabel, lost_streak: int, camera_is_opened: bool) -> None:
+        """Update one preview's small always-visible status badge from the same signal-lost bookkeeping _update_previews/_maybe_show_signal_lost already track every tick -- no extra per-tick cost, just a different presentation of the same numbers.
+
+        Three states, unlike _maybe_show_signal_lost's own all-or-nothing swap (which only ever
+        shows once lost_streak reaches _SIGNAL_LOST_TICK_THRESHOLD): green while frames are
+        arriving normally, amber for the stretch between a first dropped read and that threshold
+        (earlier visibility into a camera that's just starting to have trouble, before it's bad
+        enough to blank the preview itself), red once the threshold is actually hit -- reusing the
+        same opened-vs-not distinction _maybe_show_signal_lost makes so the two never disagree
+        about whether a camera is "offline" vs. merely "signal lost".
+        """
+        if lost_streak == 0:
+            badge.setText("● Live")
+            badge.setStyleSheet(f"font-size: 9pt; font-weight: bold; margin-left: 6px; color: {_CAMERA_STATUS_LIVE_COLOR};")
+        elif lost_streak < _SIGNAL_LOST_TICK_THRESHOLD:
+            badge.setText("● Reconnecting…")
+            badge.setStyleSheet(
+                f"font-size: 9pt; font-weight: bold; margin-left: 6px; color: {_CAMERA_STATUS_RECONNECTING_COLOR};"
+            )
+        else:
+            badge.setText("● Camera offline" if not camera_is_opened else "● Signal lost")
+            badge.setStyleSheet(f"font-size: 9pt; font-weight: bold; margin-left: 6px; color: {_CAMERA_STATUS_LOST_COLOR};")
 
     def _update_doc_quality_warning(self, frame: np.ndarray) -> None:
         """Show/hide the quality banner above the document preview based on the live frame's actual resolution and sharpness.
@@ -2705,9 +3218,22 @@ class MainWindow(QMainWindow):
             doc_image_path = DOC_IMAGE_DIR / f"{timestamp}_doc.jpg"
             cv2.imwrite(str(face_image_path), face_frame)
             cv2.imwrite(str(doc_image_path), doc_frame)
+            # Generated eagerly from the same in-memory frames just written above (no extra disk
+            # read) so _load_thumbnail's cache-hit path covers this scan from its very first
+            # history-list render, rather than falling back to its own lazy-generate-on-first-read
+            # path -- see that function's own docstring.
+            write_thumbnail_cache(str(face_image_path), face_frame, _THUMBNAIL_SIZE[0], _THUMBNAIL_SIZE[1])
+            write_thumbnail_cache(str(doc_image_path), doc_frame, _THUMBNAIL_SIZE[0], _THUMBNAIL_SIZE[1])
             # Sized after writing rather than re-walking the whole image directory tree to find the
-            # new total -- see MainWindow._add_to_cached_storage_bytes.
-            self._add_to_cached_storage_bytes(face_image_path.stat().st_size + doc_image_path.stat().st_size)
+            # new total -- see MainWindow._add_to_cached_storage_bytes. Includes each image's
+            # cached thumbnail file too, so this incremental count doesn't drift from a full
+            # recount (which walks the whole directory and picks those files up regardless).
+            self._add_to_cached_storage_bytes(
+                face_image_path.stat().st_size
+                + doc_image_path.stat().st_size
+                + thumbnail_cache_path(str(face_image_path)).stat().st_size
+                + thumbnail_cache_path(str(doc_image_path)).stat().st_size
+            )
 
             match_result = analysis.match_result
             scan_id = insert_scan(
@@ -2735,6 +3261,7 @@ class MainWindow(QMainWindow):
 
             new_scan = get_scan_by_id(self.conn, scan_id)
             self._all_scans.insert(0, new_scan)  # newest-first, matches list_scans' own order
+            self._rebuild_person_index()
             self._recompute_filtered_scans()
             # A fresh capture is always the newest scan on record, so if it matches the current
             # filters it always belongs directly above every currently-loaded row -- insert it there

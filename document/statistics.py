@@ -13,8 +13,28 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 
+from document.dates import calculate_age, parse_mrz_style_date
 from document.flag_matcher import normalize_name_tokens, normalize_personal_number
 from storage.models import ScanRecord
+
+# Age buckets for the Statistics tab's age-distribution chart, in display order (youngest to
+# oldest) -- fixed and always shown in this order, rather than sorted by count like the other
+# breakdown charts in this file, since age reads naturally left-to-right/young-to-old.
+_AGE_BUCKETS: list[tuple[str, int, int]] = [  # (label, min_age_inclusive, max_age_inclusive)
+    ("Under 18", 0, 17),
+    ("18-25", 18, 25),
+    ("26-35", 26, 35),
+    ("36-45", 36, 45),
+    ("46-60", 46, 60),
+    ("61+", 61, 999),
+]
+
+
+def _age_bucket_label(age_years: int) -> str:
+    for label, min_age, max_age in _AGE_BUCKETS:
+        if min_age <= age_years <= max_age:
+            return label
+    return _AGE_BUCKETS[-1][0]  # unreachable given the open-ended final bucket, but never raises
 
 # Average calendar-month/year lengths, used only to convert an exact avg-per-day figure into an
 # approximate avg-per-month/year one -- not a claim about any specific month/year.
@@ -111,6 +131,7 @@ class Statistics:
 
     doc_type_counts: dict[str, int]
     nationality_counts: dict[str, int]  # ISO alpha-3 -> count, every country seen (caller truncates for display)
+    age_bucket_counts: dict[str, int]  # bucket label (see _AGE_BUCKETS) -> count, insertion order = display order
 
 
 def _delta_percent(current: int, previous: int) -> float | None:
@@ -130,6 +151,7 @@ def compute_statistics(scans: list[ScanRecord], now: datetime | None = None) -> 
     image_quality_reason_counts: Counter[str] = Counter()
     doc_type_counts: Counter[str] = Counter()
     nationality_counts: Counter[str] = Counter()
+    age_bucket_counts: Counter[str] = Counter()
     person_counts: Counter[str] = Counter()
 
     match_scores: list[float] = []
@@ -159,6 +181,10 @@ def compute_statistics(scans: list[ScanRecord], now: datetime | None = None) -> 
         fields = _doc_fields(scan)
         if fields:
             ocr_extracted_count += 1
+
+            birth_date = parse_mrz_style_date(fields.get("birth_date", ""), assume_past=True)
+            if birth_date is not None:
+                age_bucket_counts[_age_bucket_label(calculate_age(birth_date, as_of=now.date()))] += 1
 
         detail = _detail(scan)
         image_quality = detail.get("image_quality") or {}
@@ -246,6 +272,7 @@ def compute_statistics(scans: list[ScanRecord], now: datetime | None = None) -> 
         repeat_visit_rate=repeat_visit_rate,
         doc_type_counts=dict(doc_type_counts),
         nationality_counts=dict(nationality_counts),
+        age_bucket_counts={label: age_bucket_counts.get(label, 0) for label, _, _ in _AGE_BUCKETS},
     )
 
 

@@ -226,6 +226,14 @@ def build_statistics_report_html(stats: Statistics, trends: KpiTrends, daily_vol
     doc_type_items = [
         (doc_type_label(doc_type), count, doc_type_color(doc_type, CATEGORICAL_LIGHT)) for doc_type, count in stats.doc_type_counts.items()
     ]
+    # Fixed bucket order (see document/statistics.py::_AGE_BUCKETS), colors assigned positionally
+    # from the categorical palette -- same reasoning as ui/settings_window.py's on-screen version
+    # of this same chart.
+    age_items = [
+        (label, count, CATEGORICAL_LIGHT[index % len(CATEGORICAL_LIGHT)])
+        for index, (label, count) in enumerate(stats.age_bucket_counts.items())
+        if count > 0
+    ]
 
     nationality_items = top_n_with_other(stats.nationality_counts, 10)
     nationality_icons = [
@@ -256,6 +264,7 @@ def build_statistics_report_html(stats: Statistics, trends: KpiTrends, daily_vol
 <div class="chart-row">
 {_chart_block_html(_pie_chart_svg(validation_items), _legend_table_html(validation_items), "Document validation status")}
 {_chart_block_html(_pie_chart_svg(doc_type_items), _legend_table_html(doc_type_items), "Document type")}
+{_chart_block_html(_pie_chart_svg(age_items), _legend_table_html(age_items), "Age distribution (readable birth dates only)")}
 </div>
 
 <h2>Nationality / issuing country (top 10)</h2>

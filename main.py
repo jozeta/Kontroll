@@ -7,6 +7,7 @@ import time
 from types import TracebackType
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication
 
 from config.app_paths import (
@@ -18,11 +19,12 @@ from config.app_paths import (
 )
 from prerequisites import run_prerequisite_check
 
-# ui.splash only depends on PyQt6 itself (see that module), so -- unlike ui.main_window/
-# ui.settings_window, which pull in insightface/cv2/pytesseract at module level -- it's safe to
-# import this early, before run_prerequisite_check(). Shown for the entire remaining startup
-# sequence below (prerequisite check, DB init, model load, camera open), which is the slow part an
-# operator would otherwise stare at a blank taskbar entry for.
+# ui.splash/ui.app_icon only depend on PyQt6 itself (see those modules), so -- unlike
+# ui.main_window/ui.settings_window, which pull in insightface/cv2/pytesseract at module level --
+# it's safe to import these early, before run_prerequisite_check(). Shown for the entire remaining
+# startup sequence below (prerequisite check, DB init, model load, camera open), which is the slow
+# part an operator would otherwise stare at a blank taskbar entry for.
+from ui.app_icon import render_app_logo
 from ui.splash import build_splash_screen
 
 logger = logging.getLogger(__name__)
@@ -96,6 +98,9 @@ def main() -> None:
     # check specifically so a missing package is caught by that check (with an offer to
     # install it) rather than crashing the process with an ImportError beforehand.
     app = QApplication(sys.argv)
+    # Every top-level window without its own explicit icon inherits this one -- previously nothing
+    # set a window/taskbar icon at all, so every window just showed Windows' generic default.
+    app.setWindowIcon(QIcon(render_app_logo(64)))
 
     splash = build_splash_screen()
     splash.show()
