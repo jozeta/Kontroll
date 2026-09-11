@@ -80,6 +80,7 @@ from document.flag_matcher import FlagMatch, find_matching_flagged_person, match
 from document.image_quality import (
     ImageQualityResult,
     assess_image_quality,
+    compute_blur_score,
     is_frame_too_blurry,
     is_resolution_too_low_for_ocr,
 )
@@ -3083,7 +3084,7 @@ class MainWindow(QMainWindow):
         doc_frame = (
             self._pending_doc_frame
             if self._pending_doc_frame is not None
-            else self.camera_manager.get_doc_latest_frame()
+            else self._pick_sharpest_recent_doc_frame()
         )
 
         if face_frame is None or doc_frame is None:
@@ -3121,6 +3122,27 @@ class MainWindow(QMainWindow):
             on_finished=lambda analysis: self._finish_save_capture(analysis, face_frame, doc_frame),
             on_failed=self._on_save_capture_failed,
         )
+
+    def _pick_sharpest_recent_doc_frame(self) -> np.ndarray | None:
+        """Return the least-blurry of the document camera's last few buffered frames (see CameraManager.get_doc_recent_frames), not just whichever was newest at the exact instant of the click.
+
+        A single fixed snapshot is vulnerable to catching a genuinely bad instant -- a hand still
+        settling the card, a brief autofocus hunt, a momentary hologram glare -- even though a
+        frame from a fraction of a second earlier or later would have OCR'd cleanly; this was a
+        real, reported source of misread characters, truncated names, and OCR picking up the wrong
+        (or multiple merged) printed lines, all of which blur specifically makes worse: sharper
+        edges are what let Tesseract's own line/character segmentation tell lines and glyphs apart
+        correctly in the first place, not just read each one more legibly. Scored with
+        document.image_quality.compute_blur_score -- the same cheap (no OCR needed) Laplacian-
+        variance proxy this app already uses elsewhere to flag a blurry capture -- rather than
+        running the full, much more expensive OCR/MRZ/barcode pipeline on every candidate and
+        comparing *that*: only the actual winner ever goes through the real pipeline, exactly as
+        before, so this adds a few milliseconds of scoring, not several extra seconds of OCR.
+        """
+        candidates = self.camera_manager.get_doc_recent_frames()
+        if not candidates:
+            return None
+        return max(candidates, key=compute_blur_score)
 
     def _flash_capture_previews(self) -> None:
         """Briefly flash both live preview panes white -- an immediate, camera-shutter-style visual cue that a capture just happened, fired the moment a still frame was actually grabbed from both cameras (not merely on the button click, which can still be waiting on one camera -- see the frame-still-missing branch above this call site). Purely cosmetic: runs synchronously and returns immediately, well before the background analysis pipeline (which can take several seconds) finishes."""

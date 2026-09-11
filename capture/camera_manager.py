@@ -3,6 +3,7 @@
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Final, Literal
 
@@ -65,6 +66,15 @@ _RESOLUTION_CANDIDATES: list[tuple[int, int]] = [
 # failing forever. ~1.5s -- a little after the UI's own "signal lost" warning already appears, so
 # the operator sees the warning and then (usually) sees it clear itself as the reopen succeeds.
 _RECONNECT_AFTER_FAILURES = 45
+
+# How many of each camera's most recently read frames _CameraReaderThread keeps (see
+# get_recent_frames), on top of the single "latest" one it always kept before this existed. At the
+# preview poll's own ~30fps, this covers a bit under a quarter of a second of real recent history --
+# enough that a single momentarily-blurry frame (a hand still settling the card, a brief autofocus
+# hunt) very likely has a sharper neighbor sitting right next to it in the buffer, without reaching
+# so far back that a "recent" frame is actually stale relative to what the operator is looking at
+# right now. See MainWindow._pick_sharpest_recent_doc_frame for the actual selection this enables.
+_RECENT_FRAME_BUFFER_SIZE = 6
 
 # A single preview-tick capture.read() call taking longer than this is a real, user-visible
 # problem, not just a diagnostic curiosity: read_face_preview_frame/read_doc_preview_frame are
@@ -736,6 +746,9 @@ class _CameraReaderThread:
 
         self._frame_lock = threading.Lock()
         self._latest_frame: np.ndarray | None = None
+        # A short rolling history of recently-read frames, alongside the single "latest" one above
+        # -- see get_recent_frames and _RECENT_FRAME_BUFFER_SIZE's own comment for why this exists.
+        self._recent_frames: deque[np.ndarray] = deque(maxlen=_RECENT_FRAME_BUFFER_SIZE)
 
         self._paused = threading.Event()  # set = paused (no reads happening)
         self._stop_requested = threading.Event()
@@ -766,12 +779,18 @@ class _CameraReaderThread:
                 _record_frame_timestamp(self.frame_timestamps, read_finished_at)
                 with self._frame_lock:
                     self._latest_frame = frame
+                    self._recent_frames.append(frame)
             else:
                 self.read_failures += 1
 
     def get_latest_frame(self) -> np.ndarray | None:
         with self._frame_lock:
             return self._latest_frame
+
+    def get_recent_frames(self) -> list[np.ndarray]:
+        """Return up to the last _RECENT_FRAME_BUFFER_SIZE successfully-read frames, oldest first -- empty if none have been read yet (e.g. right after opening). Each is the same frame object get_latest_frame would have returned at the moment it was read, so a caller comparing/scoring them (e.g. MainWindow._pick_sharpest_recent_doc_frame) is choosing among genuinely distinct recent reads, not repeatedly re-fetching whatever's currently newest."""
+        with self._frame_lock:
+            return list(self._recent_frames)
 
     def pause(self) -> None:
         """Stop this thread from issuing any further capture.read() calls, blocking until any
@@ -793,6 +812,7 @@ class _CameraReaderThread:
         self.frame_timestamps = []
         with self._frame_lock:
             self._latest_frame = None
+            self._recent_frames.clear()
 
     def stop(self) -> None:
         self._stop_requested.set()
@@ -895,6 +915,20 @@ class CameraManager:
     def get_doc_latest_frame(self) -> np.ndarray | None:
         """Return the document camera's latest buffered frame -- see get_face_latest_frame's docstring."""
         return self._doc_reader.get_latest_frame()
+
+    def get_doc_recent_frames(self) -> list[np.ndarray]:
+        """Return the document camera's last few buffered frames (see _CameraReaderThread.get_recent_frames), oldest first.
+
+        Document-camera-only (no face-camera equivalent): this exists specifically so the Capture
+        button can pick the *sharpest* of several recent frames for OCR (see
+        MainWindow._pick_sharpest_recent_doc_frame) rather than whichever single frame happened to
+        be newest at the exact instant of the click -- a real source of misread characters/lines
+        when that one instant caught motion blur or a momentary hologram glare, even though a
+        frame from a fraction of a second earlier or later would have OCR'd cleanly. Face matching
+        has no equivalent need for this: it isn't sensitive to which exact millisecond's frame is
+        used the way character-level OCR is.
+        """
+        return self._doc_reader.get_recent_frames()
 
     def _reopen_face_camera(self) -> None:
         logger.warning("Face camera index %d unresponsive; attempting to reopen", self.face_camera_index)
