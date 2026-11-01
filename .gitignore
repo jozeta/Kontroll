@@ -38,3 +38,14 @@ Thumbs.db
 .claude/
 .mcp.json
 CLAUDE.local.md
+
+# --- Baseline: macOS, Claude Code and secrets ---
+._*
+.remember/
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
