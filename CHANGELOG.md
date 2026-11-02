@@ -6,6 +6,8 @@ The project has no tagged releases yet, so changes are grouped by date. Entries 
 
 ## 2026-11-02
 
+- Security: Pillow 12.3 → 13.0, fixing 41 Dependabot alerts (5 critical, 23 high). Pillow 13 needs Python 3.11+, which the app already requires.
+- Dependencies: onnxruntime 1.23 → 1.31, PyQt6 6.11 → 6.12, numpy 2.2 → 2.5, OpenCV 4.12 → 4.14 (numpy 2.5 needs OpenCV 4.13+). Verified on Linux with OCR, MRZ, PDF417 and face matching; webcam capture (Windows DirectShow) still needs a check on Windows.
 - Add Dependabot config, security policy
 
 ## 2026-11-01
