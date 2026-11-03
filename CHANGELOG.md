@@ -4,6 +4,8 @@ All notable changes to Kontroll are listed here, newest first.
 
 The project has no tagged releases yet, so changes are grouped by date. Entries before November 2026 were reconstructed from the commit history.
 
+## Unreleased
+
 ## 2026-11-02
 
 - Security: Pillow 12.3 → 13.0, fixing 41 Dependabot alerts (5 critical, 23 high). Pillow 13 needs Python 3.11+, which the app already requires.
