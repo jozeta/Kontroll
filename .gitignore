@@ -49,3 +49,7 @@ CLAUDE.local.md
 *.key
 *.p12
 *.pfx
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/

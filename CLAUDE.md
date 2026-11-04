@@ -22,8 +22,10 @@ Building a standalone/portable EXE (PyInstaller `--onedir`, plus optionally bund
 and the InsightFace model as portable folder copies) is a separate, longer workflow — see
 README.md "Building a standalone EXE" and "Portable / USB-stick deployment", not repeated here.
 
-There is no automated test suite (no pytest, no `tests/` directory). Verification during
-development has been done with throwaway ad-hoc scripts run against the venv interpreter,
+`tests/test_documents.py` covers the pure document logic (printed and MRZ dates, ages, AAMVA
+barcodes, under-18/expiry flags) and needs only `pytest` and `mrz`: `python -m pytest -q`. CI runs
+it with `ruff check .` (settings in `ruff.toml`, incl. the security rules). Everything that needs the
+camera, Qt, OpenCV or InsightFace has no automated tests; verification there has been done with throwaway ad-hoc scripts run against the venv interpreter,
 exercising real library behavior rather than mocks wherever practical (e.g. generating a
 genuinely valid ICAO 9303 MRZ via `mrz.generator.td3.TD3CodeGenerator` and checksum-validating
 it, or a real PDF417 encode→decode round trip via `zxingcpp.create_barcode`/`read_barcodes`,
@@ -489,3 +491,8 @@ explicitly opts into placing alongside the app, so resolving them relative to `s
   varies by device — a camera that ignores these simply keeps behaving as it did before, same
   accepted-limitation pattern as `set_exact_resolution`'s own resolution fallback. The slider
   ranges are reasonable starting points, not calibrated per-device.
+
+## App standards
+
+This repo follows the app standards in `~/Desktop/code/tools/standards/STANDARDS.md` (rule IDs,
+severities; decisions and waivers in `.claude-standards`). `claude-check --repo .` checks it.

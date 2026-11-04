@@ -10,7 +10,6 @@ printed or read as a standalone document, not viewed side-by-side with the theme
 
 import html
 import math
-from datetime import datetime
 
 from document.country_flags import alpha2_for_country_code
 from document.statistics import DailyCount, KpiTrends, Statistics, scans_last_30_days_delta_percent, top_n_with_other

@@ -1348,7 +1348,7 @@ class ImageViewerWindow(QWidget):
         if not pixmap.isNull():
             self.image_view.set_image(pixmap)
 
-        assert self._scan is not None and self._on_reanalyze is not None  # guarded by edit_button's own construction
+        assert self._scan is not None and self._on_reanalyze is not None  # noqa: S101 -- type narrowing; guarded by edit_button's own construction
         confirm = QMessageBox.question(
             self,
             "Re-analyze scan",

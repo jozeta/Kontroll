@@ -264,7 +264,7 @@ def install_python_packages() -> bool:
     if _is_frozen():
         return False
     requirements_path = Path(__file__).resolve().parent / "requirements.txt"
-    result = subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(requirements_path)])
+    result = subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(requirements_path)])  # noqa: S603 -- fixed arguments
     return result.returncode == 0
 
 
@@ -276,8 +276,8 @@ def install_tesseract() -> bool:
     a newly-installed binary's PATH update would not otherwise be visible to this already-running
     process until it exits and a new one starts.
     """
-    result = subprocess.run(
-        [
+    result = subprocess.run(  # noqa: S603 -- fixed arguments
+        [  # noqa: S607 -- winget is found on PATH by design
             "winget", "install", "--id", "UB-Mannheim.TesseractOCR", "-e",
             "--accept-package-agreements", "--accept-source-agreements",
         ]
@@ -313,7 +313,7 @@ def install_ocr_language_packs() -> bool:
         if destination.exists():
             continue
         try:
-            with urllib.request.urlopen(_TESSDATA_FAST_URL_TEMPLATE.format(lang_code=lang_code), timeout=30) as response:
+            with urllib.request.urlopen(_TESSDATA_FAST_URL_TEMPLATE.format(lang_code=lang_code), timeout=30) as response:  # noqa: S310 -- constant https URL
                 destination.write_bytes(response.read())
         except (OSError, urllib.error.URLError):
             logger.exception("Failed to download the '%s' Tesseract language pack to %s", lang_code, destination)

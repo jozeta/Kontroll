@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Lint (ruff; settings in ruff.toml)
+        run: pipx run ruff==0.17.3 check .
+      # The tests cover the pure document logic, which needs only the small mrz package (the app's
+      # Qt/OpenCV/InsightFace stack is Windows-desktop and isn't installed here).
+      - run: pip install pytest mrz==0.6.2
+      - name: Tests
+        run: python -m pytest -q

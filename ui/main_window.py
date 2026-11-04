@@ -502,7 +502,6 @@ def _analyze_capture(
     # ImageEditDialog's "what would this image extract to" preview can run the exact same logic
     # rather than risk drifting out of sync with it).
     document_fields_result = extract_document_fields(doc_frame)
-    doc_analysis_frame = document_fields_result.doc_analysis_frame
     ocr_words = document_fields_result.ocr_words
     ocr_text = document_fields_result.ocr_text
     mrz_result = document_fields_result.mrz_result

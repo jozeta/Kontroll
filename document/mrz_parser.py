@@ -102,7 +102,7 @@ def _try_td3_from_line2_only(candidate_lines: list[str]) -> MrzResult | None:
         mrz_code = _TD3_PLACEHOLDER_LINE1 + "\n" + candidate
         try:
             checker = TD3CodeChecker(mrz_code)
-        except Exception:
+        except Exception:  # noqa: S112 -- expected for non-MRZ candidates; try the next one
             # A genuine line 1 (misclassified here as a "lone line 2" candidate) or other
             # malformed input can make the checker's own parsing raise -- try the next candidate
             # rather than letting this best-effort recovery attempt crash the capture.
