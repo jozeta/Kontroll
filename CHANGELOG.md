@@ -2,10 +2,13 @@
 
 All notable changes to Kontroll are listed here, newest first.
 
-The project has no tagged releases yet, so changes are grouped by date. Entries before November 2026 were reconstructed from the commit history.
+The project has no tagged releases yet; version numbering starts at 1.0.0 (2026-11-12) and changes are grouped by date. Entries before November 2026 were reconstructed from the commit history.
 
 ## Unreleased
 
+## 1.0.0 - 2026-11-12
+
+- Versioning: the app has a version number (`VERSION`, read by `app_version.py`), shown in the main window title and the start-up log line, and printed by `python main.py --version`. The README shows it and has a "What's new" section. The PyInstaller command bundles `VERSION`. 1.0.0 is the first numbered version and includes the changes below.
 - First automated tests (`tests/test_documents.py`: dates, ages, AAMVA barcodes, under-18/expiry
   flags), ruff with the security rules (`ruff.toml`), and a CI workflow that runs both
 

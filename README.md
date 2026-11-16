@@ -1,10 +1,20 @@
 # Kontroll — Local ID Verification App
 
-A local, offline-first Windows 11 desktop application (window title: **Kontroll**) that verifies
+A local, offline-first Windows 11 desktop application (window title: **Kontroll** followed by the version number) that verifies
 a person's identity by matching a live webcam photo of their face against the photo on a scanned
 ID document (passport, national ID card, or driving licence), and validates the authenticity of
 the document itself. Intended for use at a staffed desk, where an operator manually triggers each
 capture and reviews each result. No data leaves the local machine at runtime.
+
+Version: **1.0.0** (kept in the `VERSION` file; shown in the main window's title bar and by `python main.py --version`)
+
+## What's new in 1.0.0
+
+- The app now has a version number: in the window title, in the log's start-up line and via `python main.py --version`.
+- First automated tests, ruff with the security rules, and a CI workflow that runs both.
+- Pillow 13 and updated dependencies (fixes 41 Dependabot alerts); webcam capture on Windows still needs a re-check after the upgrade.
+
+Older changes are listed in [CHANGELOG.md](CHANGELOG.md).
 
 ## Setup
 
@@ -148,7 +158,7 @@ at all.
 ```
 venv\Scripts\activate
 pip install pyinstaller
-pyinstaller --onedir --name Kontroll --noconfirm --additional-hooks-dir=pyinstaller_hooks main.py
+pyinstaller --onedir --name Kontroll --noconfirm --additional-hooks-dir=pyinstaller_hooks --add-data "VERSION;." main.py
 ```
 
 `--additional-hooks-dir=pyinstaller_hooks` is required, not optional: `pyinstaller_hooks/hook-insightface.py`

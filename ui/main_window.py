@@ -55,6 +55,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app_version import get_version
 from capture.camera_manager import CameraManager
 from config.app_paths import get_documents_dir, get_faces_dir, get_flagged_images_dir
 from config.settings import (
@@ -1904,7 +1905,7 @@ class MainWindow(QMainWindow):
         self._loaded_count: int = 0
         self._history_page_size: int = get_history_page_size(self.conn)
 
-        self.setWindowTitle("Kontroll")
+        self.setWindowTitle(f"Kontroll {get_version()}")
         self._build_layout()
         self._load_history()
         self._restore_window_state()

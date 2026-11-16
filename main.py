@@ -17,6 +17,7 @@ from config.app_paths import (
     get_logs_dir,
     pop_completed_relocation,
 )
+from app_version import get_version
 from prerequisites import run_prerequisite_check
 
 # ui.splash/ui.app_icon only depend on PyQt6 itself (see those modules), so -- unlike
@@ -90,8 +91,11 @@ def apply_debug_logging_setting(enabled: bool) -> None:
 
 def main() -> None:
     """Bootstrap the app: check prerequisites, initialize storage, purge expired scans, load the face model, and launch the UI."""
+    if "--version" in sys.argv[1:]:
+        print(f"Kontroll {get_version()}")
+        return
     _configure_logging()
-    logger.info("Starting Kontroll (log file: %s)", LOG_PATH)
+    logger.info("Starting Kontroll %s (log file: %s)", get_version(), LOG_PATH)
 
     # QApplication must exist before any prerequisite dialog can be shown, so this is
     # constructed first; every other import below is deferred until after the prerequisite
